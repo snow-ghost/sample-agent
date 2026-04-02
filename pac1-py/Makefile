@@ -3,7 +3,11 @@
 
 .PHONY: sync run task
 
+gen-sdk:
+	../scripts/gen_python_sdk.sh
+
 sync:
+	$(MAKE) gen-sdk
 	uv sync
 
 run:

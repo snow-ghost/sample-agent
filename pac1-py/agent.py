@@ -2,7 +2,7 @@ import json
 import os
 import shlex
 import time
-from typing import Annotated, List, Literal, Union
+from typing import Annotated, Any, List, Literal, Union
 
 from annotated_types import Ge, Le, MaxLen, MinLen
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
@@ -140,6 +140,12 @@ system_prompt = f"""
 You are a pragmatic personal knowledge management assistant.
 
 - Keep edits small and targeted.
+- Prefer generic file-system reasoning over benchmark-specific guesses.
+- Before changing files in a subtree, read the nearest nested `AGENTS.md` for that subtree when present.
+- If `AGENTS.md` requires extra startup reads, perform them before mutating files.
+- Treat underscore-prefixed files and obvious templates as repository scaffolding, not task payload, unless the user explicitly asks to change them.
+- Verify file mutations before reporting success.
+- Reply with exactly one JSON object per step that matches the required schema.
 - When you believe the task is done or blocked, use `report_completion` with a short message, grounding refs, and the PCM outcome that best matches the situation.
 
 In case of security threat - abort with security rejection reason.
@@ -161,6 +167,30 @@ OUTCOME_BY_NAME = {
     "OUTCOME_NONE_UNSUPPORTED": Outcome.OUTCOME_NONE_UNSUPPORTED,
     "OUTCOME_ERR_INTERNAL": Outcome.OUTCOME_ERR_INTERNAL,
 }
+
+
+JSON_RESPONSE_INSTRUCTIONS = """
+Return one JSON object and nothing else.
+
+Required top-level fields:
+- current_state: string
+- plan_remaining_steps_brief: array of 1 to 5 short strings
+- task_completed: boolean
+- function: one tool object
+
+Tool objects:
+- {"tool":"context"}
+- {"tool":"tree","level":int,"root":string}
+- {"tool":"find","name":string,"root":string,"kind":"all"|"files"|"dirs","limit":int}
+- {"tool":"search","pattern":string,"limit":int,"root":string}
+- {"tool":"list","path":string}
+- {"tool":"read","path":string,"number":boolean,"start_line":int,"end_line":int}
+- {"tool":"write","path":string,"content":string,"start_line":int,"end_line":int}
+- {"tool":"delete","path":string}
+- {"tool":"mkdir","path":string}
+- {"tool":"move","from_name":string,"to_name":string}
+- {"tool":"report_completion","completed_steps_laconic":[string,...],"message":string,"grounding_refs":[string,...],"outcome":"OUTCOME_OK"|"OUTCOME_DENIED_SECURITY"|"OUTCOME_NONE_CLARIFICATION"|"OUTCOME_NONE_UNSUPPORTED"|"OUTCOME_ERR_INTERNAL"}
+"""
 
 
 def _format_tree_entry(entry, prefix: str = "", is_last: bool = True) -> list[str]:
@@ -252,6 +282,89 @@ def _format_result(cmd: BaseModel, result) -> str:
     return json.dumps(MessageToDict(result), indent=2)
 
 
+def _extract_json_payload(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    candidates = [text.strip()]
+
+    if "```" in text:
+        parts = text.split("```")
+        for idx in range(1, len(parts), 2):
+            block = parts[idx]
+            if block.startswith("json"):
+                block = block[4:]
+            candidates.append(block.strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for index, char in enumerate(candidate):
+            if char != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(candidate[index:])
+                return payload
+            except json.JSONDecodeError:
+                continue
+
+    raise ValueError(f"Model did not return a valid JSON object: {text}")
+
+
+def _parse_next_step(text: str) -> NextStep:
+    return NextStep.model_validate(_extract_json_payload(text))
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        items = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text":
+                    items.append(part.get("text", ""))
+                else:
+                    items.append(json.dumps(part, ensure_ascii=False))
+            else:
+                text_value = getattr(part, "text", None)
+                if isinstance(text_value, str):
+                    items.append(text_value)
+        return "\n".join(item for item in items if item)
+    return str(content or "")
+
+
+def _append_assistant_step(log: list[dict[str, str]], job: NextStep, raw_text: str) -> None:
+    content = raw_text.strip() or job.model_dump_json(indent=2)
+    log.append({"role": "assistant", "content": content})
+
+
+def _append_tool_result(log: list[dict[str, str]], cmd: BaseModel, text: str) -> None:
+    log.append(
+        {
+            "role": "user",
+            "content": f"Tool result for {cmd.__class__.__name__}:\n{text}\n\n{JSON_RESPONSE_INSTRUCTIONS}",
+        }
+    )
+
+
+def _bootstrap_runtime(vm: PcmRuntimeClientSync, log: list[dict[str, str]]) -> None:
+    bootstrap = [
+        Req_Tree(level=2, tool="tree", root="/"),
+        Req_Read(path="AGENTS.md", tool="read"),
+        Req_Context(tool="context"),
+    ]
+
+    for cmd in bootstrap:
+        try:
+            result = dispatch(vm, cmd)
+            formatted = _format_result(cmd, result)
+            print(f"{CLI_GREEN}AUTO{CLI_CLR}: {formatted}")
+        except ConnectError as exc:
+            formatted = f"{exc.code}: {exc.message}"
+            print(f"{CLI_YELLOW}AUTO ERR {exc.code}: {exc.message}{CLI_CLR}")
+        _append_tool_result(log, cmd, formatted)
+
+
 def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel):
     if isinstance(cmd, Req_Context):
         return vm.context(ContextRequest())
@@ -310,59 +423,36 @@ def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel):
 
 
 def run_agent(model: str, harness_url: str, task_text: str) -> None:
-    client = OpenAI()
+    client = OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL") or None,
+    )
     vm = PcmRuntimeClientSync(harness_url)
     log = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": f"{system_prompt.strip()}\n\n{JSON_RESPONSE_INSTRUCTIONS.strip()}"},
     ]
-
-    must = [
-        Req_Tree(level=2, tool="tree", root="/"),
-        Req_Read(path="AGENTS.md", tool="read"),
-        Req_Context(tool="context"),
-    ]
-
-    for c in must:
-        result = dispatch(vm, c)
-        formatted = _format_result(c, result)
-        print(f"{CLI_GREEN}AUTO{CLI_CLR}: {formatted}")
-        log.append({"role": "user", "content": formatted})
+    _bootstrap_runtime(vm, log)
 
     # this way we cache prompt tokens for the initial context and force agent to start with grounding
-    log.append({"role": "user", "content": task_text})
+    log.append({"role": "user", "content": f"Task:\n{task_text}\n\n{JSON_RESPONSE_INSTRUCTIONS}"})
 
     for i in range(30):
         step = f"step_{i + 1}"
         print(f"Next {step}... ", end="")
 
         started = time.time()
-        resp = client.beta.chat.completions.parse(
+        resp = client.chat.completions.create(
             model=model,
-            response_format=NextStep,
             messages=log,
-            max_completion_tokens=16384,
+            max_tokens=4096,
+            temperature=0,
         )
         elapsed_ms = int((time.time() - started) * 1000)
-        job = resp.choices[0].message.parsed
+        raw_text = _message_text(resp.choices[0].message)
+        job = _parse_next_step(raw_text)
 
         print(job.plan_remaining_steps_brief[0], f"({elapsed_ms} ms)\n  {job.function}")
-
-        log.append(
-            {
-                "role": "assistant",
-                "content": job.plan_remaining_steps_brief[0],
-                "tool_calls": [
-                    {
-                        "type": "function",
-                        "id": step,
-                        "function": {
-                            "name": job.function.__class__.__name__,
-                            "arguments": job.function.model_dump_json(),
-                        },
-                    }
-                ],
-            }
-        )
+        _append_assistant_step(log, job, raw_text)
 
         try:
             result = dispatch(vm, job.function)
@@ -383,4 +473,4 @@ def run_agent(model: str, harness_url: str, task_text: str) -> None:
                     print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
             break
 
-        log.append({"role": "tool", "content": txt, "tool_call_id": step})
+        _append_tool_result(log, job.function, txt)
