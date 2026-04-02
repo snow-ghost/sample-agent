@@ -26,6 +26,7 @@ More specific `AGENTS.md` files refine the local implementation details for thei
 - Design for capability-driven behavior, not for one task catalog.
 - Keep prompts, policies, limits, and model ids configurable through environment variables or small typed config objects.
 - Favor stable interfaces and narrow adapters around external SDKs.
+- Treat repository paths as case-sensitive by default. Preserve the exact filename casing observed from `list`, `tree`, and `read` results instead of assuming the filesystem will normalize it.
 
 ## Architectural Defaults For Agents
 
@@ -70,6 +71,7 @@ Pragmatic default for this repository:
 ## Testing And Validation
 
 - Prefer fast local validation over heavy test scaffolding.
+- Prefer BDD-style tests for agent policy and loop behavior: describe scenarios in terms of `Given / When / Then`, then implement the smallest deterministic check that proves the behavior.
 - For protocol changes, check backward compatibility and generated SDK impact.
 - For agent changes, validate the bootstrap path, tool dispatch, failure path, and completion path.
 - Test the generic loop behavior before task-specific heuristics.

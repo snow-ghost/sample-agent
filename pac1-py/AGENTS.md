@@ -32,6 +32,8 @@ Do not split earlier than necessary. Small and direct is still the default.
 - Keep completion reporting explicit and typed.
 - Put tunables behind environment variables or small constants, not string literals scattered through the code.
 - Prefer extraction of tiny pure helpers over repeated inline formatting logic.
+- Use BDD for policy and loop changes. Express scenarios as `Given / When / Then`, then implement deterministic tests for those scenarios with minimal tooling.
+- Treat contest paths as case-sensitive. Reuse the exact casing returned by the runtime and try known filename variants only when the policy intentionally supports them.
 
 ## Dependency Rules
 
