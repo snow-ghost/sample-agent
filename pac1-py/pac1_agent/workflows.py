@@ -32,6 +32,12 @@ class ContactCandidate:
     account_notes: str
 
 
+@dataclass(frozen=True)
+class ChannelStatusRequest:
+    channel_name: str
+    status: str
+
+
 def parse_email_inbox_message(text: str) -> EmailInboxMessage | None:
     match = re.search(r"^From:\s*(.*?)\s*<([^>]+)>\s*$", text, re.MULTILINE)
     if match is None:
@@ -69,15 +75,28 @@ def parse_requested_invoice_account(text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def _strip_matching_quotes(text: str) -> str:
+    value = text.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1].strip()
+    return value
+
+
 def parse_explicit_email_instruction(text: str) -> tuple[str, str, str] | None:
     match = re.search(
-        r"Write a brief email to (\S+) with subject \"([^\"]+)\" and body '([^']*)'",
+        r"write\s+(?:a\s+)?brief\s+email\s+to\s+(?P<recipient>\"[^\"]+\"|'[^']+'|\S+)\s+"
+        r"with\s+subject\s+(?P<subject_quote>\"|')(?P<subject>.*?)(?P=subject_quote)\s+"
+        r"and\s+body\s+(?P<body_quote>\"|')(?P<body>.*?)(?P=body_quote)",
         text,
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     )
     if match is None:
         return None
-    return match.group(1).strip(), match.group(2).strip(), match.group(3)
+    return (
+        _strip_matching_quotes(match.group("recipient")),
+        match.group("subject").strip(),
+        match.group("body"),
+    )
 
 
 def parse_ai_insights_followup_target(text: str) -> str | None:
@@ -92,19 +111,31 @@ def parse_direct_outbound_request(text: str) -> tuple[str, str, str] | None:
         re.IGNORECASE,
     )
     if match is not None:
-        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+        return _strip_matching_quotes(match.group(1)), match.group(2).strip(), match.group(3).strip()
 
     reminder_match = re.search(
         r"email\s+reminder\s+to\s+(.+?)\s+with\s+subject\s+\"([^\"]+)\"\s+and\s+about\s+\"([^\"]+)\"",
         text,
         re.IGNORECASE,
     )
-    if reminder_match is None:
+    if reminder_match is not None:
+        return (
+            _strip_matching_quotes(reminder_match.group(1)),
+            reminder_match.group(2).strip(),
+            reminder_match.group(3).strip(),
+        )
+
+    followup_match = re.search(
+        r"send\s+(?:a\s+)?short\s+follow-up\s+email\s+to\s+(.+?)\s+about\s+(.+?)(?:\.\s|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if followup_match is None:
         return None
     return (
-        reminder_match.group(1).strip(),
-        reminder_match.group(2).strip(),
-        reminder_match.group(3).strip(),
+        _strip_matching_quotes(followup_match.group(1)),
+        "Quick follow-up",
+        f"Checking in about {followup_match.group(2).strip().rstrip('.')}.",
     )
 
 
@@ -132,6 +163,62 @@ def parse_channel_statuses(text: str) -> dict[str, str]:
     return statuses
 
 
+def is_inbox_processing_request(text: str) -> bool:
+    lowered = " ".join(text.lower().split())
+    references_inbox = "inbox" in lowered or "inbound note" in lowered or "inbound message" in lowered
+    return references_inbox and any(
+        marker in lowered
+        for marker in (
+            "process",
+            "handle",
+            "triage",
+            "review",
+            "resolve",
+            "next file",
+            "next message",
+            "work through",
+            "oldest inbox",
+            "oldest message",
+            "review the next",
+            "act on it",
+            "work the oldest",
+        )
+    )
+
+
+def parse_channel_status_lookup_request(
+    text: str,
+    channel_statuses: dict[str, set[str]],
+) -> ChannelStatusRequest | None:
+    lowered = " ".join(text.lower().split())
+    if not any(marker in lowered for marker in ("how many", "count ", "number of", "total ")):
+        return None
+
+    matched_channel: str | None = None
+    for channel_name in sorted(channel_statuses, key=len, reverse=True):
+        for alias in _channel_aliases(channel_name):
+            if alias in lowered:
+                matched_channel = channel_name
+                break
+        if matched_channel is not None:
+            break
+    if matched_channel is None:
+        return None
+
+    matched_status: str | None = None
+    for status in sorted(channel_statuses.get(matched_channel, set()), key=len, reverse=True):
+        for alias in _status_aliases(status):
+            if alias in lowered:
+                matched_status = status
+                break
+        if matched_status is not None:
+            break
+    if matched_status is None:
+        return None
+
+    return ChannelStatusRequest(channel_name=matched_channel, status=matched_status)
+
+
 def consume_otp_token(text: str, token: str) -> str | None:
     remaining = [line for line in text.splitlines() if line.strip() and line.strip() != token]
     if not remaining:
@@ -152,9 +239,16 @@ def count_channel_status(text: str, status: str) -> int:
     return total
 
 
+def collect_channel_status_values(text: str) -> set[str]:
+    return {status for status in parse_channel_statuses(text).values() if status}
+
+
 def looks_suspicious_inbox_name(name: str) -> bool:
     lowered = name.lower()
-    return any(token in lowered for token in ("exec", "approval", "override", "ignore", "prompt", "instruction"))
+    return any(
+        token in lowered
+        for token in ("exec", "approval", "override", "ignore", "prompt", "instruction", "admin", "priority", "escalation")
+    )
 
 
 def names_match(a: str, b: str) -> bool:
@@ -181,3 +275,24 @@ def choose_ai_insights_contact(candidates: list[ContactCandidate]) -> ContactCan
 def extract_purchase_prefix(purchase_id: str) -> str | None:
     match = re.match(r"^([a-zA-Z-]+)\d+$", purchase_id.strip())
     return match.group(1) if match else None
+
+
+def _channel_aliases(channel_name: str) -> set[str]:
+    base = channel_name.strip().lower()
+    aliases = {
+        base,
+        base.replace("_", " "),
+        base.replace("-", " "),
+        f"{base} channel",
+    }
+    return {alias for alias in aliases if alias}
+
+
+def _status_aliases(status: str) -> set[str]:
+    base = status.strip().lower()
+    aliases = {base}
+    if base.endswith("list"):
+        aliases.add(f"{base}ed")
+    if not base.endswith("s"):
+        aliases.add(f"{base}s")
+    return {alias for alias in aliases if alias}

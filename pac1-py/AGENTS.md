@@ -8,6 +8,7 @@ This subtree contains the PAC1 Python contest agent. Optimize for correctness, s
 - Reuse the generated BitGN SDK and protobuf types directly instead of wrapping everything in another framework.
 - Avoid benchmark-id branching or task-id hardcoding unless there is no protocol-level alternative.
 - Prefer generic file-system reasoning over PAC1-specific heuristics.
+- Prefer capability discovery plus broad intent classes over phrase-specific routing. Narrow keyword heuristics are a last-resort fallback, not the primary architecture.
 
 ## Preferred Structure
 

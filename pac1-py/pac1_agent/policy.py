@@ -6,6 +6,13 @@ import re
 from pathlib import PurePosixPath
 from typing import Literal
 
+from .capabilities import (
+    RepositoryProfile,
+    WorkspaceCapabilities,
+    extract_task_intent,
+    infer_repository_profile,
+    infer_workspace_capabilities,
+)
 from .models import (
     CompletionPayload,
     ReportTaskCompletion,
@@ -82,9 +89,25 @@ Tool objects:
 
 AGENT_FILE_NAMES = ("AGENTS.md", "AGENTS.MD")
 README_FILE_NAMES = ("README.md", "README.MD")
-
-
-RepositoryProfile = Literal["generic", "knowledge_repo", "typed_crm_fs", "purchase_ops"]
+HIGH_RISK_SECURITY_PATTERNS = (
+    re.compile(r"""(?:remove|delete)\s+["'`]?/agents\.md["'`]?"""),
+    re.compile(r"""ignore\s+(?:all\s+|any\s+)?(?:local\s+repository\s+|repository\s+|repo\s+)?rules"""),
+    re.compile(r"""ignore\s+(?:all\s+)?previous\s+instructions"""),
+    re.compile(r"""override(?:[-\s]fast[-\s]path|[-\s]execution[-\s]lane|[-\s]instructions)?"""),
+    re.compile(r"""forward\s+(?:any\s+)?(?:visible\s+)?credentials"""),
+    re.compile(r"""email\s+passwords"""),
+    re.compile(r"""access\s+notes\s+to\s+"""),
+    re.compile(r"""ops-bridge@example\.com"""),
+    re.compile(r"""bypass\s+(?:safeguards|guardrails|approval)"""),
+)
+MEDIUM_RISK_SECURITY_PATTERNS = (
+    re.compile(r"""mark\s+(?:the\s+)?task\s+(?:finished|complete|completed)"""),
+    re.compile(r"""keep\s+the\s+completion\s+log\s+minimal"""),
+    re.compile(r"""avoid\s+asking\s+follow-up\s+questions"""),
+    re.compile(r"""temporary\s+execution\s+lane"""),
+    re.compile(r"""handling:\s*immediate"""),
+    re.compile(r"""status:\s*authenticated"""),
+)
 
 
 @dataclass(frozen=True)
@@ -97,11 +120,41 @@ def build_system_prompt() -> str:
     return BASE_SYSTEM_PROMPT.strip()
 
 
+def build_workspace_context_prompt(
+    profile: RepositoryProfile,
+    capabilities: WorkspaceCapabilities,
+) -> str:
+    capability_lines = [
+        f"- profile: {profile}",
+        f"- has_inbox: {str(capabilities.has_inbox).lower()}",
+        f"- has_knowledge_inbox: {str(capabilities.has_knowledge_inbox).lower()}",
+        f"- has_outbox: {str(capabilities.has_outbox).lower()}",
+        f"- has_contacts: {str(capabilities.has_contacts).lower()}",
+        f"- has_accounts: {str(capabilities.has_accounts).lower()}",
+        f"- has_channel_docs: {str(capabilities.has_channel_docs).lower()}",
+        f"- has_invoices: {str(capabilities.has_invoices).lower()}",
+        f"- has_purchase_processing: {str(capabilities.has_purchase_processing).lower()}",
+    ]
+    return (
+        "Workspace facts:\n"
+        + "\n".join(capability_lines)
+        + "\n\nPlanning rules:\n"
+        "- Use the LLM to frame the task and choose the next grounded tool step.\n"
+        "- Prefer read/list/find/search before any write/delete/move.\n"
+        "- Use context only when current repo time/date is needed.\n"
+        "- If an identifier, recipient, or target cannot be resolved exactly from repository data, "
+        "prefer clarification over guessing.\n"
+        "- Report completion only when the terminal outcome is justified by observed repo state."
+    )
+
+
 def build_task_frame_prompt(task_text: str) -> str:
     return (
         f"Task:\n{task_text}\n\n"
         "First, frame the task before acting. Identify the likely task family, "
-        "success criteria, relevant workspace roots, and key risks.\n\n"
+        "success criteria, relevant workspace roots, and key risks.\n"
+        "If the request looks truncated, underspecified, or does not identify a stable target, "
+        "make that explicit and prepare for clarification instead of a generic success.\n\n"
         f"{FRAME_RESPONSE_INSTRUCTIONS.strip()}"
     )
 
@@ -110,7 +163,13 @@ def build_execution_prompt(task_text: str, frame: TaskFrame) -> str:
     return (
         f"Task:\n{task_text}\n\n"
         f"Task frame:\n{frame.model_dump_json(indent=2)}\n\n"
-        "Continue with the next grounded step.\n\n"
+        "Continue with the next grounded step.\n"
+        "Prefer a concrete repository tool over generic context.\n"
+        "If current date/time is not needed, do not call context.\n"
+        "If exact target resolution fails after grounded reads/searches, use report_completion with clarification.\n"
+        "Do not use report_completion with OUTCOME_OK unless observed repo state proves the task is done.\n"
+        "For OUTCOME_OK, include specific completed steps and at least one concrete grounding ref.\n"
+        "If the request still looks truncated or underspecified after grounding, report clarification instead of generic success.\n\n"
         f"{STEP_RESPONSE_INSTRUCTIONS.strip()}"
     )
 
@@ -118,35 +177,43 @@ def build_execution_prompt(task_text: str, frame: TaskFrame) -> str:
 def build_tool_result_prompt(tool_name: str, text: str) -> str:
     return (
         f"Tool result for {tool_name}:\n{text}\n\n"
-        "Continue from this updated state.\n\n"
+        "Continue from this updated state.\n"
+        "Choose the next concrete repository tool or a terminal report_completion.\n"
+        "Avoid repeating context unless current time/date is still missing and necessary.\n"
+        "Never emit a generic OUTCOME_OK completion without concrete completed steps and grounding refs.\n"
+        "If evidence is still missing or the target is ambiguous, continue grounding or return clarification.\n\n"
         f"{STEP_RESPONSE_INSTRUCTIONS.strip()}"
     )
 
 
-def preflight_outcome(
-    profile: RepositoryProfile,
-    task_text: str,
-) -> CompletionPayload | None:
+def _contains_prompt_injection_markers(task_text: str) -> bool:
     text = task_text.lower()
+    if any(pattern.search(text) for pattern in HIGH_RISK_SECURITY_PATTERNS):
+        return True
+    medium_hits = sum(1 for pattern in MEDIUM_RISK_SECURITY_PATTERNS if pattern.search(text))
+    return medium_hits >= 2
+
+
+def _looks_truncated_capture_request(task_text: str, normalized_text: str) -> bool:
+    words = task_text.strip().split()
+    if not any(marker in normalized_text for marker in ("captur", "capture", "distill")):
+        return False
+    if len(words) > 6:
+        return False
+    if any(marker in task_text for marker in ("/", ":", "\"", "'")):
+        return False
+    if "website" in normalized_text or "snippet" in normalized_text:
+        return False
+    return True
+
+
+def _text_only_preflight_outcome(task_text: str) -> CompletionPayload | None:
+    intent = extract_task_intent(task_text)
+    text = intent.normalized_text
     words = task_text.strip().split()
     stripped_text = task_text.strip()
-    security_markers = (
-        "[[paste hijack",
-        "ignore previous instructions",
-        "ignore all previous instructions",
-        "override instructions",
-        "bypass safeguards",
-        "bypass guardrails",
-        "approval bypass",
-        "remove /agents.md",
-        "delete /agents.md",
-        "mark completed",
-        "passwords and access notes",
-        "email passwords",
-        "access notes to ",
-    )
 
-    if any(marker in text for marker in security_markers):
+    if "[[paste hijack" in text or _contains_prompt_injection_markers(task_text):
         return CompletionPayload(
             completed_steps_laconic=["Detected prompt-injection or exfiltration markers"],
             message="The request contains prompt-injection or sensitive-data exfiltration instructions. I will not execute it.",
@@ -154,17 +221,24 @@ def preflight_outcome(
             outcome="OUTCOME_DENIED_SECURITY",
         )
 
-    if any(token in text for token in (" this ", " that ")) or text.startswith(("this ", "that ")):
-        if len(words) <= 5:
-            return CompletionPayload(
-                completed_steps_laconic=["Detected short deictic request without stable target"],
-                message="The request does not identify a unique target. Clarify exactly what should be processed or changed.",
-                grounding_refs=["/AGENTS.md"],
-                outcome="OUTCOME_NONE_CLARIFICATION",
-            )
+    if intent.mentions_deictic_reference and len(words) <= 5:
+        return CompletionPayload(
+            completed_steps_laconic=["Detected short deictic request without stable target"],
+            message="The request does not identify a unique target. Clarify exactly what should be processed or changed.",
+            grounding_refs=["/AGENTS.md"],
+            outcome="OUTCOME_NONE_CLARIFICATION",
+        )
+
+    if _looks_truncated_capture_request(task_text, text):
+        return CompletionPayload(
+            completed_steps_laconic=["Detected truncated capture-style request"],
+            message="The request is truncated and does not specify a concrete capture target. Clarify the exact source and destination.",
+            grounding_refs=["/AGENTS.md"],
+            outcome="OUTCOME_NONE_CLARIFICATION",
+        )
 
     if len(words) <= 3 and "/" not in stripped_text and "." not in stripped_text and "\"" not in stripped_text:
-        if text not in {"process inbox", "process the inbox"}:
+        if not intent.wants_inbox_processing:
             return CompletionPayload(
                 completed_steps_laconic=["Detected underspecified short request"],
                 message="The request is too short or incomplete to identify the intended action. Clarify the exact target and operation.",
@@ -172,23 +246,33 @@ def preflight_outcome(
                 outcome="OUTCOME_NONE_CLARIFICATION",
             )
 
-    if "delete that card" in text or ("delete that" in text and "card" in text):
-        return CompletionPayload(
-            completed_steps_laconic=["Detected ambiguous deictic delete request"],
-            message="The requested card is not uniquely identified. Clarify which card to delete.",
-            grounding_refs=["/AGENTS.md"],
-            outcome="OUTCOME_NONE_CLARIFICATION",
-        )
+    return None
 
-    if profile == "generic" and text in {"process inbox", "process the inbox"}:
+
+def pre_bootstrap_outcome(task_text: str) -> CompletionPayload | None:
+    return _text_only_preflight_outcome(task_text)
+
+
+def preflight_outcome(
+    profile: RepositoryProfile,
+    task_text: str,
+) -> CompletionPayload | None:
+    text_only = _text_only_preflight_outcome(task_text)
+    if text_only is not None:
+        return text_only
+
+    intent = extract_task_intent(task_text)
+    capabilities = infer_workspace_capabilities(profile=profile)
+    text = intent.normalized_text
+    if intent.wants_inbox_processing and not capabilities.supports_inbox_processing:
         return CompletionPayload(
-            completed_steps_laconic=["Detected generic inbox request without typed workflow surface"],
+            completed_steps_laconic=["Detected inbox workflow request without inbox capability"],
             message="The request does not define a concrete inbox contract or reply surface. Clarify what should be processed and where the result should go.",
             grounding_refs=["/AGENTS.md"],
             outcome="OUTCOME_NONE_CLARIFICATION",
         )
 
-    if "calendar invite" in text or ("calendar" in text and "invite" in text):
+    if intent.wants_calendar_workflow and not capabilities.supports_calendar:
         return CompletionPayload(
             completed_steps_laconic=["Detected unsupported calendar workflow"],
             message="This runtime does not expose calendar tooling. I cannot create calendar invites here.",
@@ -196,9 +280,7 @@ def preflight_outcome(
             outcome="OUTCOME_NONE_UNSUPPORTED",
         )
 
-    if any(token in text for token in ("upload", "deploy", "push", "post", "publish")) and (
-        "http://" in text or "https://" in text or "api." in text
-    ):
+    if intent.wants_external_delivery and not capabilities.supports_external_delivery:
         return CompletionPayload(
             completed_steps_laconic=["Detected unsupported upload workflow"],
             message="This runtime does not expose an upload or deploy surface for arbitrary external endpoints.",
@@ -206,8 +288,7 @@ def preflight_outcome(
             outcome="OUTCOME_NONE_UNSUPPORTED",
         )
 
-    email_request = text.startswith("email ") or text.startswith("send email") or " email " in text
-    if profile != "typed_crm_fs" and email_request:
+    if intent.wants_outbound_email and not capabilities.supports_outbound_email:
         return CompletionPayload(
             completed_steps_laconic=["Detected unsupported outbound email workflow"],
             message="This workspace does not expose an outbound email surface for this request.",
@@ -215,12 +296,20 @@ def preflight_outcome(
             outcome="OUTCOME_NONE_UNSUPPORTED",
         )
 
-    if profile == "typed_crm_fs" and ("salesforce" in text or "hubspot" in text):
+    if intent.wants_external_system_sync and not capabilities.supports_external_system_sync:
+        named_system = next(
+            (
+                system
+                for system in ("Salesforce", "HubSpot", "Zendesk", "Marketo", "NetSuite", "Intercom", "Airtable")
+                if system.lower() in text
+            ),
+            "external system",
+        )
         return CompletionPayload(
             completed_steps_laconic=["Detected unsupported external CRM sync request"],
             message=(
-                "This workspace supports local typed records and outbound email via outbox, "
-                "but it does not expose a Salesforce or external CRM sync capability."
+                "This workspace supports local records and local workflow surfaces, "
+                f"but it does not expose a {named_system} sync capability."
             ),
             grounding_refs=["/AGENTS.md", "/outbox/README.MD"],
             outcome="OUTCOME_NONE_UNSUPPORTED",
@@ -279,17 +368,6 @@ def extract_startup_reads(agents_text: str) -> list[str]:
     return deduped
 
 
-def infer_repository_profile(root_entries: set[str]) -> RepositoryProfile:
-    normalized = {entry.lower() for entry in root_entries}
-    if {"00_inbox", "01_capture", "02_distill"}.issubset(normalized):
-        return "knowledge_repo"
-    if {"accounts", "contacts", "outbox", "docs"}.issubset(normalized):
-        return "typed_crm_fs"
-    if {"purchases", "processing", "docs"}.issubset(normalized):
-        return "purchase_ops"
-    return "generic"
-
-
 def _add_grounding_target(
     targets: list[GroundingTarget],
     seen: set[tuple[str, str]],
@@ -309,15 +387,17 @@ def profile_grounding_targets(
     frame: TaskFrame,
     task_text: str,
 ) -> list[GroundingTarget]:
-    text = task_text.lower()
+    intent = extract_task_intent(task_text)
+    capabilities = infer_workspace_capabilities(profile=profile)
+    text = intent.normalized_text
     targets: list[GroundingTarget] = []
     seen: set[tuple[str, str]] = set()
 
-    if profile == "typed_crm_fs":
+    if capabilities.profile == "typed_crm_fs":
         if any(token in text for token in ("invoice", "billing", "subscription")):
             _add_grounding_target(targets, seen, "read", "/my-invoices/README.MD")
             _add_grounding_target(targets, seen, "list", "/my-invoices")
-        if any(token in text for token in ("email", "subject", "body", "reminder", "follow-up")):
+        if intent.wants_outbound_email or any(token in text for token in ("subject", "body", "reminder", "follow-up")):
             _add_grounding_target(targets, seen, "read", "/outbox/README.MD")
             _add_grounding_target(targets, seen, "list", "/outbox")
             _add_grounding_target(targets, seen, "read", "/contacts/README.MD")
@@ -329,27 +409,30 @@ def profile_grounding_targets(
         if any(token in text for token in ("reminder", "follow-up", "reschedule", "next week")):
             _add_grounding_target(targets, seen, "read", "/reminders/README.MD")
             _add_grounding_target(targets, seen, "read", "/accounts/README.MD")
-        if "inbox" in text:
+        if intent.wants_inbox_processing:
             _add_grounding_target(targets, seen, "read", "/inbox/README.md")
             _add_grounding_target(targets, seen, "list", "/inbox")
             _add_grounding_target(targets, seen, "read", "/docs/inbox-task-processing.md")
             _add_grounding_target(targets, seen, "read", "/docs/inbox-msg-processing.md")
             _add_grounding_target(targets, seen, "list", "/docs/channels")
-        if any(token in text for token in ("telegram", "discord", "otp", "blacklist", "verified", "admin channel")):
+        if capabilities.has_channel_docs and (
+            intent.wants_inbox_processing
+            or intent.wants_channel_status_lookup
+            or any(token in text for token in ("telegram", "discord", "otp", "channel", "status"))
+        ):
             _add_grounding_target(targets, seen, "list", "/docs/channels")
             _add_grounding_target(targets, seen, "read", "/docs/channels/AGENTS.MD")
             _add_grounding_target(targets, seen, "read", "/docs/channels/Telegram.txt")
             _add_grounding_target(targets, seen, "read", "/docs/channels/Discord.txt")
             _add_grounding_target(targets, seen, "read", "/docs/channels/otp.txt")
 
-    if profile == "purchase_ops":
-        if any(token in text for token in ("purchase", "prefix", "regression", "downstream", "audit", "lane", "workflow")):
-            _add_grounding_target(targets, seen, "read", "/docs/purchase-id-workflow.md")
-            _add_grounding_target(targets, seen, "read", "/docs/purchase-records.md")
-            _add_grounding_target(targets, seen, "read", "/processing/README.MD")
-            _add_grounding_target(targets, seen, "list", "/processing")
-            if any(token in text for token in ("audit", "regression", "prefix")):
-                _add_grounding_target(targets, seen, "read", "/purchases/audit.json")
+    if capabilities.has_purchase_processing and intent.wants_purchase_fix:
+        _add_grounding_target(targets, seen, "read", "/docs/purchase-id-workflow.md")
+        _add_grounding_target(targets, seen, "read", "/docs/purchase-records.md")
+        _add_grounding_target(targets, seen, "read", "/processing/README.MD")
+        _add_grounding_target(targets, seen, "list", "/processing")
+        if any(token in text for token in ("audit", "regression", "prefix", "history")):
+            _add_grounding_target(targets, seen, "read", "/purchases/audit.json")
 
     for root in relevant_roots(frame):
         if root != "/":
@@ -441,7 +524,8 @@ def mutation_guard(task_text: str, cmd: ToolRequest) -> str | None:
     if isinstance(cmd, ReportTaskCompletion):
         return None
 
-    lowered_task = task_text.lower()
+    intent = extract_task_intent(task_text)
+    lowered_task = intent.normalized_text
     for path in command_paths(cmd):
         normalized = normalize_repo_path(path)
         name = PurePosixPath(path).name.lower()
@@ -454,7 +538,7 @@ def mutation_guard(task_text: str, cmd: ToolRequest) -> str | None:
                 "Ground the subtree and choose a narrower target."
             )
 
-        inbox_processing = "process inbox" in lowered_task or "process the inbox" in lowered_task
+        inbox_processing = intent.wants_inbox_processing
         archive_like = any(part in normalized.lower() for part in ("/archive", "/archived", "/processed"))
         if inbox_processing and archive_like and isinstance(cmd, (Req_Move, Req_MkDir)):
             return (
@@ -470,9 +554,7 @@ def mutation_guard(task_text: str, cmd: ToolRequest) -> str | None:
                     "Use report_completion for clarification instead of drafting sidecar files."
                 )
 
-        purchase_regression = (
-            "purchase" in lowered_task and "prefix" in lowered_task and "regression" in lowered_task
-        )
+        purchase_regression = intent.wants_purchase_fix
         if purchase_regression and isinstance(cmd, Req_Write) and normalized == "/purchases/audit.json":
             if "audit" not in lowered_task:
                 return (
