@@ -473,21 +473,21 @@ def _local_fallback_command(session: AgentSessionState) -> ToolRequest | None:
     intent = extract_task_intent(session.task_text)
 
     if session.repository_profile == "knowledge_repo":
-        if any(marker in task_text for marker in ("thread", "card", "captured", "remove", "discard", "delete")):
+        if intent.wants_cleanup_or_delete:
             sequence = [
                 Req_Read(tool="read", path="/99_process/document_cleanup.md"),
                 Req_Read(tool="read", path="/02_distill/AGENTS.md"),
                 Req_List(tool="list", path="/02_distill/cards"),
                 Req_List(tool="list", path="/02_distill/threads"),
             ]
-        elif "capture" in task_text or "distill" in task_text:
+        elif intent.wants_capture_or_distill:
             sequence = [
                 Req_Read(tool="read", path="/99_process/document_capture.md"),
                 Req_List(tool="list", path="/00_inbox"),
                 Req_List(tool="list", path="/01_capture/influential"),
                 Req_List(tool="list", path="/02_distill"),
             ]
-        elif "inbox" in task_text:
+        elif intent.wants_inbox_processing:
             sequence = [
                 Req_Read(tool="read", path="/99_process/process_tasks.md"),
                 Req_List(tool="list", path="/00_inbox"),
@@ -496,7 +496,7 @@ def _local_fallback_command(session: AgentSessionState) -> ToolRequest | None:
         else:
             sequence = [Req_List(tool="list", path="/02_distill")]
     elif session.repository_profile == "typed_crm_fs":
-        if "email address" in task_text or "return only the email" in task_text:
+        if intent.wants_lookup_email:
             sequence = [
                 Req_List(tool="list", path="/contacts"),
                 Req_Read(tool="read", path="/contacts/README.MD"),
@@ -512,7 +512,7 @@ def _local_fallback_command(session: AgentSessionState) -> ToolRequest | None:
                 Req_List(tool="list", path="/my-invoices"),
                 Req_Read(tool="read", path="/my-invoices/README.MD"),
             ]
-        elif any(marker in task_text for marker in ("follow-up", "follow up", "reconnect", "reschedule")):
+        elif intent.wants_follow_up_update:
             sequence = [
                 Req_List(tool="list", path="/reminders"),
                 Req_Read(tool="read", path="/reminders/README.MD"),

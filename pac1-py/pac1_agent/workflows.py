@@ -4,6 +4,8 @@ from collections import Counter
 from dataclasses import dataclass
 import re
 
+from .capabilities import extract_task_intent
+
 
 @dataclass(frozen=True)
 class EmailInboxMessage:
@@ -164,26 +166,7 @@ def parse_channel_statuses(text: str) -> dict[str, str]:
 
 
 def is_inbox_processing_request(text: str) -> bool:
-    lowered = " ".join(text.lower().split())
-    references_inbox = "inbox" in lowered or "inbound note" in lowered or "inbound message" in lowered
-    return references_inbox and any(
-        marker in lowered
-        for marker in (
-            "process",
-            "handle",
-            "triage",
-            "review",
-            "resolve",
-            "next file",
-            "next message",
-            "work through",
-            "oldest inbox",
-            "oldest message",
-            "review the next",
-            "act on it",
-            "work the oldest",
-        )
-    )
+    return extract_task_intent(text).wants_inbox_processing
 
 
 def parse_channel_status_lookup_request(

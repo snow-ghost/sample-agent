@@ -6,6 +6,62 @@ from typing import Iterable, Literal
 
 
 RepositoryProfile = Literal["generic", "knowledge_repo", "typed_crm_fs", "purchase_ops"]
+INBOX_REFERENCE_MARKERS = (
+    "inbox",
+    "inbound note",
+    "inbound message",
+    "incoming message",
+    "incoming note",
+)
+INBOX_ACTION_MARKERS = (
+    "process",
+    "handle",
+    "triage",
+    "review",
+    "resolve",
+    "work through",
+    "work the oldest",
+    "act on it",
+)
+INBOX_SEQUENCE_MARKERS = (
+    "next file",
+    "next message",
+    "next inbox",
+    "oldest inbox",
+    "oldest message",
+    "oldest pending",
+    "review the next",
+)
+OUTBOUND_EMAIL_MARKERS = (
+    "email",
+    "e-mail",
+    "send email",
+    "send a note",
+    "send a message",
+    "write an email",
+    "write a brief email",
+    "reply by email",
+    "reply via email",
+)
+CALENDAR_MARKERS = (
+    "calendar invite",
+    "meeting invite",
+    "schedule meeting",
+    "schedule a meeting",
+    "book meeting",
+)
+EXTERNAL_DELIVERY_MARKERS = ("upload", "deploy", "push", "post", "publish", "submit", "send", "call", "invoke")
+EXTERNAL_SYSTEM_MARKERS = ("salesforce", "hubspot", "zendesk", "marketo", "netsuite", "intercom", "airtable")
+CHANNEL_SURFACE_MARKERS = ("channel", "telegram", "discord")
+CHANNEL_STATUS_MARKERS = ("status", "blacklist", "verified", "admin", "valid")
+COUNT_STYLE_MARKERS = ("how many", "count ", "number of", "total ")
+PURCHASE_MARKERS = ("purchase", "invoice id", "id prefix")
+PURCHASE_FIX_MARKERS = ("prefix", "regression", "downstream", "lane", "workflow", "emitter", "processing")
+FOLLOW_UP_MARKERS = ("follow-up", "follow up", "reminder", "next follow-up", "followup")
+FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to")
+LOOKUP_EMAIL_MARKERS = ("email address", "primary contact email", "return only the email", "answer with the email")
+CLEANUP_KNOWLEDGE_MARKERS = ("thread", "card", "captured", "remove", "discard", "delete", "start over")
+CAPTURE_DISTILL_MARKERS = ("capture", "captur", "distill", "snippet", "excerpt")
 
 
 @dataclass(frozen=True)
@@ -39,6 +95,24 @@ class TaskIntent:
     wants_external_system_sync: bool
     wants_channel_status_lookup: bool
     wants_purchase_fix: bool
+    wants_follow_up_update: bool
+    wants_lookup_email: bool
+    wants_capture_or_distill: bool
+    wants_cleanup_or_delete: bool
+
+
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
+def _references_inbox_surface(text: str) -> bool:
+    return _contains_any(text, INBOX_REFERENCE_MARKERS)
+
+
+def _wants_inbox_processing(text: str) -> bool:
+    return _references_inbox_surface(text) and (
+        _contains_any(text, INBOX_ACTION_MARKERS) or _contains_any(text, INBOX_SEQUENCE_MARKERS)
+    )
 
 
 def infer_repository_profile(root_entries: set[str]) -> RepositoryProfile:
@@ -93,65 +167,32 @@ def extract_task_intent(task_text: str) -> TaskIntent:
         re.search(r"(^|\s)(this|that|these|those)(\s|$)", normalized_text)
     )
 
-    wants_inbox_processing = "inbox" in normalized_text and any(
-        marker in normalized_text
-        for marker in (
-            "process",
-            "handle",
-            "triage",
-            "review",
-            "resolve",
-            "next file",
-            "next message",
-            "work through",
-            "oldest inbox",
-            "oldest message",
-            "work the oldest",
-        )
-    ) or (
-        any(marker in normalized_text for marker in ("inbound note", "inbound message"))
-        and any(marker in normalized_text for marker in ("review", "act on it", "handle", "process"))
-    )
-    wants_outbound_email = bool(
-        re.search(
-            r"\b(email|e-mail|send email|write a brief email|write an email|reply by email)\b",
-            normalized_text,
-        )
-    )
-    wants_calendar_workflow = (
-        "calendar invite" in normalized_text
-        or ("calendar" in normalized_text and "invite" in normalized_text)
-        or ("schedule" in normalized_text and "meeting" in normalized_text)
+    wants_inbox_processing = _wants_inbox_processing(normalized_text)
+    wants_outbound_email = _contains_any(normalized_text, OUTBOUND_EMAIL_MARKERS)
+    wants_calendar_workflow = _contains_any(normalized_text, CALENDAR_MARKERS) or (
+        "calendar" in normalized_text and "invite" in normalized_text
     )
     has_endpoint = bool(re.search(r"https?://|\bapi\.", normalized_text))
-    wants_external_delivery = has_endpoint and any(
-        marker in normalized_text
-        for marker in ("upload", "deploy", "push", "post", "publish", "submit", "send", "call", "invoke")
+    wants_external_delivery = has_endpoint and _contains_any(normalized_text, EXTERNAL_DELIVERY_MARKERS)
+    wants_external_system_sync = _contains_any(normalized_text, ("sync", "mirror", "export", "replicate", "push")) and _contains_any(
+        normalized_text,
+        EXTERNAL_SYSTEM_MARKERS,
     )
-    wants_external_system_sync = any(
-        marker in normalized_text for marker in ("sync", "mirror", "export", "replicate", "push")
-    ) and any(
-        system in normalized_text
-        for system in (
-            "salesforce",
-            "hubspot",
-            "zendesk",
-            "marketo",
-            "netsuite",
-            "intercom",
-            "airtable",
-        )
+    wants_channel_status_lookup = _contains_any(normalized_text, COUNT_STYLE_MARKERS) and (
+        _contains_any(normalized_text, CHANNEL_SURFACE_MARKERS)
+        or _contains_any(normalized_text, CHANNEL_STATUS_MARKERS)
     )
-    wants_channel_status_lookup = any(
-        marker in normalized_text for marker in ("how many", "count ", "number of", "total ")
-    ) and any(
-        marker in normalized_text
-        for marker in ("channel", "telegram", "discord", "status", "blacklist", "verified", "admin", "valid")
+    wants_purchase_fix = _contains_any(normalized_text, PURCHASE_MARKERS) and _contains_any(
+        normalized_text,
+        PURCHASE_FIX_MARKERS,
     )
-    wants_purchase_fix = "purchase" in normalized_text and any(
-        marker in normalized_text
-        for marker in ("prefix", "regression", "downstream", "lane", "workflow", "emitter", "processing")
+    wants_follow_up_update = _contains_any(normalized_text, FOLLOW_UP_MARKERS) and _contains_any(
+        normalized_text,
+        FOLLOW_UP_UPDATE_MARKERS,
     )
+    wants_lookup_email = _contains_any(normalized_text, LOOKUP_EMAIL_MARKERS)
+    wants_capture_or_distill = _contains_any(normalized_text, CAPTURE_DISTILL_MARKERS)
+    wants_cleanup_or_delete = _contains_any(normalized_text, CLEANUP_KNOWLEDGE_MARKERS)
 
     return TaskIntent(
         normalized_text=normalized_text,
@@ -164,4 +205,8 @@ def extract_task_intent(task_text: str) -> TaskIntent:
         wants_external_system_sync=wants_external_system_sync,
         wants_channel_status_lookup=wants_channel_status_lookup,
         wants_purchase_fix=wants_purchase_fix,
+        wants_follow_up_update=wants_follow_up_update,
+        wants_lookup_email=wants_lookup_email,
+        wants_capture_or_distill=wants_capture_or_distill,
+        wants_cleanup_or_delete=wants_cleanup_or_delete,
     )

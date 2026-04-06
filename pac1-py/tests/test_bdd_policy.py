@@ -56,6 +56,31 @@ class PolicyBddTests(unittest.TestCase):
         self.assertTrue(intent.wants_inbox_processing)
         self.assertTrue(is_inbox_processing_request("Review the next inbound note and act on it."))
 
+    def test_given_work_through_oldest_pending_incoming_message_when_extracting_intent_then_it_is_classified_as_inbox_processing(self) -> None:
+        intent = extract_task_intent("Work through the oldest pending incoming message and resolve it safely.")
+
+        self.assertTrue(intent.wants_inbox_processing)
+        self.assertTrue(is_inbox_processing_request("Work through the oldest pending incoming message and resolve it safely."))
+
+    def test_given_move_next_follow_up_request_when_extracting_intent_then_follow_up_update_is_detected(self) -> None:
+        intent = extract_task_intent("Move the next follow-up with Blue Harbor Bank to 2026-04-03.")
+
+        self.assertTrue(intent.wants_follow_up_update)
+
+    def test_given_primary_contact_email_lookup_request_when_extracting_intent_then_email_lookup_is_detected(self) -> None:
+        intent = extract_task_intent(
+            "What is the primary contact email for the Dutch port-operations shipping account? Return only the email."
+        )
+
+        self.assertTrue(intent.wants_lookup_email)
+
+    def test_given_capture_excerpt_request_when_extracting_intent_then_capture_or_distill_is_detected(self) -> None:
+        intent = extract_task_intent(
+            'Save this excerpt into capture and distill it: "small deterministic workflows beat large autonomous loops."'
+        )
+
+        self.assertTrue(intent.wants_capture_or_distill)
+
     def test_given_crm_inbox_task_when_building_grounding_plan_then_includes_docs_and_channels(self) -> None:
         frame = TaskFrame(
             current_state="new inbox request",
