@@ -1,7 +1,7 @@
 import unittest
 
 from pac1_agent.capabilities import infer_workspace_capabilities
-from pac1_agent.framing import derive_high_confidence_frame
+from pac1_agent.framing import derive_fallback_frame, derive_high_confidence_frame
 
 
 class FramingBddTests(unittest.TestCase):
@@ -72,6 +72,28 @@ class FramingBddTests(unittest.TestCase):
         )
 
         self.assertIsNone(frame)
+
+    def test_given_local_frame_failure_for_crm_lookup_when_deriving_fallback_then_lookup_roots_are_still_grounded(self) -> None:
+        frame = derive_fallback_frame(
+            "What is the exact legal name of the Dutch forecasting consultancy Northstar account?",
+            "typed_crm_fs",
+            infer_workspace_capabilities(profile="typed_crm_fs"),
+        )
+
+        self.assertEqual(frame.category, "lookup")
+        self.assertIn("/accounts", frame.relevant_roots)
+        self.assertIn("/contacts", frame.relevant_roots)
+
+    def test_given_local_frame_failure_for_knowledge_inbox_when_deriving_fallback_then_security_sensitive_roots_are_selected(self) -> None:
+        frame = derive_fallback_frame(
+            "Process the oldest inbox item safely.",
+            "knowledge_repo",
+            infer_workspace_capabilities(profile="knowledge_repo"),
+        )
+
+        self.assertEqual(frame.category, "security_sensitive")
+        self.assertIn("/00_inbox", frame.relevant_roots)
+        self.assertIn("/99_process", frame.relevant_roots)
 
 
 if __name__ == "__main__":

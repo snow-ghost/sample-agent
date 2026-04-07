@@ -8,6 +8,9 @@ from typing import Iterable, Literal
 RepositoryProfile = Literal["generic", "knowledge_repo", "typed_crm_fs", "purchase_ops"]
 INBOX_REFERENCE_MARKERS = (
     "inbox",
+    "queue",
+    "incoming queue",
+    "inbound queue",
     "inbound note",
     "inbound message",
     "incoming message",
@@ -21,6 +24,7 @@ INBOX_REFERENCE_MARKERS = (
 INBOX_ACTION_MARKERS = (
     "process",
     "handle",
+    "take care of",
     "triage",
     "review",
     "resolve",
@@ -66,20 +70,25 @@ COUNT_STYLE_MARKERS = ("how many", "count ", "number of", "total ")
 PURCHASE_MARKERS = ("purchase", "invoice id", "id prefix")
 PURCHASE_FIX_MARKERS = ("prefix", "regression", "downstream", "lane", "workflow", "emitter", "processing")
 FOLLOW_UP_MARKERS = ("follow-up", "follow up", "reminder", "next follow-up", "followup")
-FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to")
+FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to", "bump", "move out")
 LOOKUP_EMAIL_MARKERS = ("email address", "primary contact email", "return only the email", "answer with the email")
 CLEANUP_KNOWLEDGE_MARKERS = ("thread", "card", "captured", "remove", "discard", "delete", "start over")
 CAPTURE_DISTILL_MARKERS = ("capture", "captur", "distill", "snippet", "excerpt")
 ACTION_WORDS = frozenset({"process", "handle", "triage", "review", "resolve", "work", "act", "sort"})
 ORDER_WORDS = frozenset({"next", "oldest", "earliest", "pending", "unread", "unresolved", "lowest", "first"})
 INBOX_WORDS = frozenset({"inbox", "inbound", "incoming"})
-ITEM_WORDS = frozenset({"message", "messages", "note", "notes", "item", "items", "drop", "drops", "file", "files"})
+ITEM_WORDS = frozenset(
+    {"message", "messages", "note", "notes", "item", "items", "drop", "drops", "file", "files", "queue"}
+)
 EMAIL_WORDS = frozenset({"email", "mail", "address"})
 OUTBOUND_WORDS = frozenset({"send", "write", "reply", "draft", "compose"})
 ROLE_WORDS = frozenset({"primary", "contact", "manager", "lead", "owner"})
+ROLE_ACTION_WORDS = frozenset({"manage", "manages", "managed", "own", "owns", "owned"})
 ANSWER_STYLE_WORDS = frozenset({"return", "answer", "give", "just", "only", "what", "provide", "share"})
 FOLLOW_UP_WORDS = frozenset({"follow", "followup", "reminder", "touchpoint", "reconnect", "checkin"})
-UPDATE_WORDS = frozenset({"move", "reschedule", "postpone", "shift", "change", "fix", "update", "set", "push", "delay"})
+UPDATE_WORDS = frozenset(
+    {"move", "reschedule", "postpone", "shift", "change", "fix", "update", "set", "push", "delay", "bump"}
+)
 CAPTURE_WORDS = frozenset({"capture", "captur", "distill", "distillation", "snippet", "excerpt", "clip", "quote"})
 DELETE_WORDS = frozenset({"remove", "discard", "delete", "purge", "clear"})
 TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -174,11 +183,15 @@ def _wants_lookup_email(text: str, tokens: tuple[str, ...]) -> bool:
         return True
     if not _has_any_token(tokens, EMAIL_WORDS):
         return False
-    has_role_shape = _has_any_token(tokens, ROLE_WORDS) and "account" in tokens
+    has_role_shape = (_has_any_token(tokens, ROLE_WORDS) or _has_any_token(tokens, ROLE_ACTION_WORDS)) and (
+        "account" in tokens
+    )
     has_contact_shape = "contact" in tokens and ("primary" in tokens or "account" in tokens)
     if not (has_role_shape or has_contact_shape):
         return False
-    return _has_any_token(tokens, ANSWER_STYLE_WORDS)
+    if _has_any_token(tokens, ANSWER_STYLE_WORDS):
+        return True
+    return not _has_any_token(tokens, OUTBOUND_WORDS)
 
 
 def _wants_capture_or_distill(text: str, tokens: tuple[str, ...]) -> bool:

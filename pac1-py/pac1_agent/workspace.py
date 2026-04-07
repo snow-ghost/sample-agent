@@ -14,7 +14,9 @@ from .capabilities import (
     infer_workspace_capabilities,
 )
 from .models import TaskFrame
+from .models import Req_List, Req_Read, ToolRequest
 from .pathing import AGENT_FILE_NAMES, normalize_repo_path
+from .workflows import parse_invoice_creation_request
 
 
 @dataclass(frozen=True)
@@ -170,3 +172,68 @@ def profile_grounding_targets(
             _add_grounding_target(targets, seen, "list", root)
 
     return targets
+
+
+def local_fallback_commands(
+    profile: RepositoryProfile,
+    task_text: str,
+) -> list[ToolRequest]:
+    intent = extract_task_intent(task_text)
+    text = intent.normalized_text
+
+    if profile == "knowledge_repo":
+        if intent.wants_cleanup_or_delete:
+            return [
+                Req_Read(tool="read", path="/99_process/document_cleanup.md"),
+                Req_Read(tool="read", path="/02_distill/AGENTS.md"),
+                Req_List(tool="list", path="/02_distill/cards"),
+                Req_List(tool="list", path="/02_distill/threads"),
+            ]
+        if intent.wants_capture_or_distill:
+            return [
+                Req_Read(tool="read", path="/99_process/document_capture.md"),
+                Req_List(tool="list", path="/00_inbox"),
+                Req_List(tool="list", path="/01_capture/influential"),
+                Req_List(tool="list", path="/02_distill"),
+            ]
+        if intent.wants_inbox_processing:
+            return [
+                Req_Read(tool="read", path="/99_process/process_tasks.md"),
+                Req_List(tool="list", path="/00_inbox"),
+                Req_List(tool="list", path="/02_distill"),
+            ]
+        return [Req_List(tool="list", path="/02_distill")]
+
+    if profile == "typed_crm_fs":
+        if intent.wants_lookup_email:
+            return [
+                Req_List(tool="list", path="/contacts"),
+                Req_Read(tool="read", path="/contacts/README.MD"),
+            ]
+        if intent.wants_outbound_email:
+            return [
+                Req_List(tool="list", path="/contacts"),
+                Req_Read(tool="read", path="/outbox/README.MD"),
+                Req_List(tool="list", path="/accounts"),
+            ]
+        if parse_invoice_creation_request(task_text) is not None or any(
+            token in text for token in ("invoice", "billing", "subscription")
+        ):
+            return [
+                Req_List(tool="list", path="/my-invoices"),
+                Req_Read(tool="read", path="/my-invoices/README.MD"),
+            ]
+        if intent.wants_follow_up_update:
+            return [
+                Req_List(tool="list", path="/reminders"),
+                Req_Read(tool="read", path="/reminders/README.MD"),
+                Req_List(tool="list", path="/accounts"),
+            ]
+        if intent.wants_inbox_processing:
+            return [
+                Req_List(tool="list", path="/inbox"),
+                Req_Read(tool="read", path="/inbox/README.md"),
+            ]
+        return [Req_List(tool="list", path="/")]
+
+    return [Req_List(tool="list", path="/")]

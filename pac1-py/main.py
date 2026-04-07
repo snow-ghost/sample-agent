@@ -1,7 +1,9 @@
 import os
 import json
+import sys
 import textwrap
 import time
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from bitgn.harness_connect import HarnessServiceClientSync
@@ -19,6 +21,20 @@ CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
+
+
+class _TeeStdout:
+    def __init__(self, *streams) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
 
 
 def _render_summary_table(task_rows: list[dict[str, str | int | float]]) -> str:
@@ -135,9 +151,15 @@ def _save_metrics(task_rows: list[dict[str, str | int | float]], final_score: fl
     return json_path, csv_path
 
 
-def main() -> None:
-    task_filter = os.sys.argv[1:]
+def _full_run_log_path(task_filter: list[str]) -> Path | None:
+    if task_filter:
+        return None
+    output_dir = Path("benchmark-runs")
+    output_dir.mkdir(exist_ok=True)
+    return output_dir / "latest_full_run.txt"
 
+
+def _run_benchmark(task_filter: list[str]) -> None:
     scores = []
     task_rows: list[dict[str, str | int | float]] = []
     try:
@@ -236,6 +258,18 @@ def main() -> None:
         else:
             print("METRICS_JSON: skipped for partial run")
             print("METRICS_CSV: skipped for partial run")
+
+
+def main() -> None:
+    task_filter = os.sys.argv[1:]
+    log_path = _full_run_log_path(task_filter)
+    if log_path is None:
+        _run_benchmark(task_filter)
+        return
+
+    with log_path.open("w", encoding="utf-8") as log_file:
+        with redirect_stdout(_TeeStdout(sys.stdout, log_file)):
+            _run_benchmark(task_filter)
 
 
 if __name__ == "__main__":

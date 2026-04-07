@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import time
 from typing import Any
@@ -140,8 +141,8 @@ def format_result(cmd: ToolRequest, result: Any) -> str:
 class PcmRuntimeAdapter:
     def __init__(self, harness_url: str) -> None:
         self.client = PcmRuntimeClientSync(harness_url)
-        self.retry_attempts = 2
-        self.retry_delay_seconds = 0.2
+        self.retry_attempts = int(os.getenv("PCM_RETRY_ATTEMPTS", "4"))
+        self.retry_delay_seconds = float(os.getenv("PCM_RETRY_DELAY_SECONDS", "0.25"))
 
     def _is_transient_error(self, exc: Exception) -> bool:
         if isinstance(exc, ConnectError):
@@ -159,7 +160,7 @@ class PcmRuntimeAdapter:
                 last_exc = exc
                 if attempt >= attempts - 1 or not self._is_transient_error(exc):
                     raise
-                time.sleep(self.retry_delay_seconds)
+                time.sleep(self.retry_delay_seconds * (attempt + 1))
         assert last_exc is not None
         raise last_exc
 
