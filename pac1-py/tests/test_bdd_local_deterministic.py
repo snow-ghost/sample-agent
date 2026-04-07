@@ -10,36 +10,43 @@ from pac1_agent.loop import (
     AgentSessionState,
     _account_query_score,
     _bootstrap,
+    _build_capture_markdown,
+    _build_generic_capture_card_markdown,
+    _choose_thread_path,
+    _derive_capture_card_title,
     _fallback_frame,
     _handle_contact_email_lookup,
-    _prepare_command,
-    _parse_account_manager_email_account,
-    _parse_direct_capture_snippet_request,
     _handle_direct_outbound_email,
-    _parse_followup_reschedule_request,
-    _parse_legal_name_account_request,
-    _parse_manager_account_listing_request,
-    _parse_primary_contact_email_account,
-    _parse_explicit_capture_request,
-    _parse_email_lookup_target,
-    _parse_invoice_creation_request,
-    _parse_thread_discard_target,
-    _parse_two_week_followup_account,
+    _read_named_channel_status_text,
     run_agent,
 )
 from pac1_agent.models import ReportTaskCompletion
 from pac1_agent.capabilities import infer_workspace_capabilities
+from pac1_agent.verifier import prepare_command
+from pac1_agent.workflows import (
+    parse_account_manager_email_account,
+    parse_direct_capture_snippet_request,
+    parse_email_lookup_target,
+    parse_explicit_capture_request,
+    parse_followup_reschedule_request,
+    parse_invoice_creation_request,
+    parse_legal_name_account_request,
+    parse_manager_account_listing_request,
+    parse_primary_contact_email_account,
+    parse_thread_discard_target,
+    parse_two_week_followup_account,
+)
 
 
 class LocalDeterministicBddTests(unittest.TestCase):
     def test_given_thread_discard_request_when_parsing_then_target_markdown_name_is_extracted(self) -> None:
         self.assertEqual(
-            _parse_thread_discard_target("Discard thread 2026-03-23__ai-engineering-foundations entirely, don't touch anything else"),
+            parse_thread_discard_target("Discard thread 2026-03-23__ai-engineering-foundations entirely, don't touch anything else"),
             "2026-03-23__ai-engineering-foundations.md",
         )
 
     def test_given_invoice_creation_request_when_parsing_then_number_and_line_items_are_extracted(self) -> None:
-        invoice_number, lines = _parse_invoice_creation_request(
+        invoice_number, lines = parse_invoice_creation_request(
             "Create invoice SR-13 with 2 lines: 'OpenAI Subscription' - 20, 'Claude Subscription' - 20"
         ) or ("", [])
 
@@ -54,7 +61,7 @@ class LocalDeterministicBddTests(unittest.TestCase):
 
     def test_given_two_week_followup_request_when_parsing_then_account_name_is_extracted(self) -> None:
         self.assertEqual(
-            _parse_two_week_followup_account(
+            parse_two_week_followup_account(
                 "Nordlicht Health asked to reconnect in two weeks. Reschedule the follow-up accordingly and keep the diff focused."
             ),
             "Nordlicht Health",
@@ -62,7 +69,7 @@ class LocalDeterministicBddTests(unittest.TestCase):
 
     def test_given_explicit_date_followup_request_when_parsing_then_account_and_date_are_extracted(self) -> None:
         self.assertEqual(
-            _parse_followup_reschedule_request(
+            parse_followup_reschedule_request(
                 "Helios Tax Group asked to move the next follow-up to 2026-08-06. Fix the follow-up date regression and keep the diff focused."
             ),
             ("Helios Tax Group", "2026-08-06"),
@@ -70,20 +77,24 @@ class LocalDeterministicBddTests(unittest.TestCase):
 
     def test_given_email_lookup_request_when_parsing_then_name_is_extracted(self) -> None:
         self.assertEqual(
-            _parse_email_lookup_target("What is the email address of Boer Milou? Return only the email"),
+            parse_email_lookup_target("What is the email address of Boer Milou? Return only the email"),
+            "Boer Milou",
+        )
+        self.assertEqual(
+            parse_email_lookup_target("Give me the address for Boer Milou?"),
             "Boer Milou",
         )
 
     def test_given_explicit_capture_request_when_parsing_then_inbox_path_and_bucket_are_extracted(self) -> None:
         self.assertEqual(
-            _parse_explicit_capture_request(
+            parse_explicit_capture_request(
                 "Take 00_inbox/2026-03-23__hn-vibe-coding-spam.md from inbox, capture it into into 'influental' folder, distill, and delete the inbox file when done."
             ),
             ("/00_inbox/2026-03-23__hn-vibe-coding-spam.md", "influental"),
         )
 
     def test_given_direct_snippet_capture_request_when_parsing_then_target_path_and_snippet_are_extracted(self) -> None:
-        parsed = _parse_direct_capture_snippet_request(
+        parsed = parse_direct_capture_snippet_request(
             'Capture this snippet from website substack.com into 01_capture/influential/2026-04-04__prompting-review-snippet.md: "Line one\\n\\nLine two"'
         )
 
@@ -96,28 +107,120 @@ class LocalDeterministicBddTests(unittest.TestCase):
             ),
         )
 
+    def test_given_generic_source_capture_when_rendering_then_artifacts_are_not_hn_specific(self) -> None:
+        source_text = (
+            "# Internal memo: rollout blockers\n\n"
+            "Captured on: 2026-04-07\n"
+            "Source URL: https://example.com/memo\n\n"
+            "Raw text:\n"
+            "Security asked for a narrower pilot scope.\n\n"
+            "Legal wants the DPA redlines first.\n\n"
+            "Ops asked for clearer rollback ownership.\n"
+        )
+
+        source_title, card_date, capture_markdown = _build_capture_markdown(source_text)
+        card_title = _derive_capture_card_title(source_title)
+        card_markdown = _build_generic_capture_card_markdown(
+            card_title,
+            card_date,
+            "/01_capture/research/2026-04-07__rollout-blockers.md",
+            source_text,
+        )
+
+        self.assertEqual(source_title, "Internal memo: rollout blockers")
+        self.assertEqual(card_date, "2026-04-07")
+        self.assertIn("preserves a concrete external input", capture_markdown)
+        self.assertEqual(card_title, "Internal memo: rollout blockers")
+        self.assertIn("Security asked for a narrower pilot scope.", card_markdown)
+        self.assertIn("Legal wants the DPA redlines first.", card_markdown)
+        self.assertNotIn("Hacker News discussion", card_markdown)
+        self.assertNotIn("vibe coding", card_markdown)
+
+    def test_given_capture_text_about_prompts_when_choosing_thread_then_matching_thread_is_selected(self) -> None:
+        runtime = MagicMock()
+        session = AgentSessionState(task_text="capture this note")
+
+        with patch(
+            "pac1_agent.loop._list_names",
+            return_value=[
+                "2026-03-23__agent-platforms-and-runtime.md",
+                "2026-03-23__ai-engineering-foundations.md",
+            ],
+        ):
+            thread_path = _choose_thread_path(
+                runtime,
+                session,
+                "The note compares prompt review loops, evals, and agent tooling tradeoffs.",
+            )
+
+        self.assertEqual(
+            thread_path,
+            "/02_distill/threads/2026-03-23__ai-engineering-foundations.md",
+        )
+
+    def test_given_named_channel_doc_when_reading_channel_status_text_then_exact_runtime_filename_is_used(self) -> None:
+        runtime = MagicMock()
+        session = AgentSessionState(task_text="process inbox")
+
+        with patch(
+            "pac1_agent.loop._list_names",
+            return_value=["Slack.txt", "otp.txt", "Telegram.txt"],
+        ), patch(
+            "pac1_agent.loop._read_text",
+            return_value="@ops-admin - admin\n@guest - valid\n",
+        ) as read_text:
+            path, text = _read_named_channel_status_text(runtime, session, "slack")
+
+        self.assertEqual(path, "/docs/channels/Slack.txt")
+        self.assertIn("@ops-admin - admin", text or "")
+        read_text.assert_called_once_with(runtime, session, "/docs/channels/Slack.txt")
+
     def test_given_account_lookup_prompts_when_parsing_then_account_descriptors_are_extracted(self) -> None:
         self.assertEqual(
-            _parse_legal_name_account_request(
+            parse_legal_name_account_request(
                 "What is the exact legal name of the DACH retail buyer with weak internal sponsorship account? Answer with the exact legal name."
             ),
             "the DACH retail buyer with weak internal sponsorship",
         )
         self.assertEqual(
-            _parse_primary_contact_email_account(
+            parse_legal_name_account_request(
+                "What is the formal company name of the DACH retail buyer with weak internal sponsorship account?"
+            ),
+            "the DACH retail buyer with weak internal sponsorship",
+        )
+        self.assertEqual(
+            parse_primary_contact_email_account(
                 "What is the email of the primary contact for the Dutch port-operations shipping account account? Return only the email."
             ),
             "the Dutch port-operations shipping account",
         )
         self.assertEqual(
-            _parse_account_manager_email_account(
+            parse_primary_contact_email_account(
+                "Give me the address for the main contact on the Dutch port-operations shipping account."
+            ),
+            "the Dutch port-operations shipping",
+        )
+        self.assertEqual(
+            parse_account_manager_email_account(
                 "What is the email address of the account manager for the Dutch forecasting consultancy Northstar account? Return only the email."
             ),
             "the Dutch forecasting consultancy Northstar",
         )
         self.assertEqual(
-            _parse_manager_account_listing_request(
+            parse_account_manager_email_account(
+                "What address should I use for the account lead on the Dutch forecasting consultancy Northstar account?"
+            ),
+            "the Dutch forecasting consultancy Northstar",
+        )
+        self.assertEqual(
+            parse_manager_account_listing_request(
                 "Which accounts are managed by Herzog Martin? Return only the account names, one per line, sorted alphabetically."
+            ),
+            "Herzog Martin",
+        )
+        self.assertEqual(
+            parse_manager_account_listing_request(
+                "List the accounts under Herzog Martin."
             ),
             "Herzog Martin",
         )
@@ -380,7 +483,7 @@ class LocalDeterministicBddTests(unittest.TestCase):
             outcome="OUTCOME_OK",
         )
 
-        guard = _prepare_command(runtime, session, payload)
+        guard = prepare_command(session.task_text, session.pending_verification_paths, payload)
 
         self.assertIsNotNone(guard)
         self.assertIn("OUTCOME_OK", guard)

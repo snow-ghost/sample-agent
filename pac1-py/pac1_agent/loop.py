@@ -10,6 +10,7 @@ from connectrpc.errors import ConnectError
 
 from .capabilities import WorkspaceCapabilities, extract_task_intent, infer_workspace_capabilities
 from .config import AgentConfig
+from .framing import derive_high_confidence_frame
 from .llm import JsonChatClient, StructuredResponseError
 from .models import (
     NextStep,
@@ -25,30 +26,29 @@ from .models import (
     ToolRequest,
 )
 from .policy import (
-    AGENT_FILE_NAMES,
     build_execution_prompt,
     build_system_prompt,
     build_task_frame_prompt,
     build_tool_result_prompt,
     build_workspace_context_prompt,
-    candidate_agent_paths,
-    candidate_read_paths,
-    clear_verified_paths,
     command_paths,
-    extract_startup_reads,
-    infer_repository_profile,
-    is_agent_instruction_path,
     is_mutating_command,
-    is_verification_command,
-    mutation_guard,
-    normalize_repo_path,
-    pre_bootstrap_outcome,
     preflight_outcome,
+)
+from .pathing import AGENT_FILE_NAMES, candidate_read_paths, is_agent_instruction_path, normalize_repo_path
+from .safety import pre_bootstrap_outcome
+from .runtime import PcmRuntimeAdapter
+from .telemetry import AgentRunTelemetry
+from .verifier import next_pending_verification_paths, prepare_command
+from .workspace import (
+    candidate_agent_paths,
+    derive_workspace_facts,
+    extract_startup_reads,
+    parse_root_entries_from_listing,
+    parse_root_entries_from_tree,
     profile_grounding_targets,
     relevant_roots,
 )
-from .runtime import PcmRuntimeAdapter
-from .telemetry import AgentRunTelemetry
 from .workflows import (
     ChannelInboxMessage,
     ChannelStatusRequest,
@@ -61,15 +61,26 @@ from .workflows import (
     is_inbox_processing_request,
     looks_suspicious_inbox_name,
     names_match,
+    parse_account_manager_email_account as _parse_account_manager_email_account,
     parse_ai_insights_followup_target,
     parse_channel_inbox_message,
     parse_channel_status_lookup_request,
     parse_channel_statuses,
+    parse_direct_capture_snippet_request as _parse_direct_capture_snippet_request,
     parse_direct_outbound_request,
+    parse_email_lookup_target as _parse_email_lookup_target,
     parse_email_inbox_message,
+    parse_explicit_capture_request as _parse_explicit_capture_request,
     parse_explicit_email_instruction,
+    parse_followup_reschedule_request as _parse_followup_reschedule_request,
+    parse_invoice_creation_request as _parse_invoice_creation_request,
+    parse_legal_name_account_request as _parse_legal_name_account_request,
+    parse_manager_account_listing_request as _parse_manager_account_listing_request,
     parse_otp_oracle_request,
+    parse_primary_contact_email_account as _parse_primary_contact_email_account,
     parse_requested_invoice_account,
+    parse_thread_discard_target as _parse_thread_discard_target,
+    parse_two_week_followup_account as _parse_two_week_followup_account,
 )
 
 CLI_RED = "\x1B[31m"
@@ -144,31 +155,6 @@ def _record_agent_file(
     return extract_startup_reads(content)
 
 
-def _parse_listing_entries(text: str) -> set[str]:
-    if "\n" not in text:
-        return set()
-    body = text.split("\n", 1)[1]
-    return {line.rstrip("/").strip() for line in body.splitlines() if line.strip() and line.strip() != "."}
-
-
-def _parse_tree_root_entries(text: str) -> set[str]:
-    entries: set[str] = set()
-    if "\n" not in text:
-        return entries
-    body = text.split("\n", 1)[1]
-    for raw_line in body.splitlines():
-        line = raw_line.rstrip()
-        if not line or line == "/":
-            continue
-        match = re.match(r"^[├└]──\s+(.+)$", line)
-        if match is None:
-            continue
-        entry = match.group(1).rstrip("/").strip()
-        if entry:
-            entries.add(entry)
-    return entries
-
-
 def _update_workspace_facts_from_root_entries(
     session: AgentSessionState,
     root_entries: set[str],
@@ -176,11 +162,7 @@ def _update_workspace_facts_from_root_entries(
     if not root_entries:
         return
     session.root_entries = root_entries
-    session.repository_profile = infer_repository_profile(session.root_entries)
-    session.capabilities = infer_workspace_capabilities(
-        root_entries=session.root_entries,
-        profile=session.repository_profile,
-    )
+    session.repository_profile, session.capabilities = derive_workspace_facts(session.root_entries)
 
 
 def _run_grounding_target(
@@ -197,7 +179,7 @@ def _run_grounding_target(
 
         listing = _auto_command(runtime, session, Req_List(tool="list", path=path))
         if path == "/" and listing:
-            _update_workspace_facts_from_root_entries(session, _parse_listing_entries(listing))
+            _update_workspace_facts_from_root_entries(session, parse_root_entries_from_listing(listing))
         return
     raise ValueError(f"Unknown grounding target kind: {kind}")
 
@@ -272,7 +254,7 @@ def _bootstrap(runtime: PcmRuntimeAdapter, session: AgentSessionState) -> None:
     _run_grounding_target(runtime, session, "list", "/")
     tree_text = _auto_command(runtime, session, Req_Tree(tool="tree", root="/", level=2))
     if not session.root_entries and tree_text:
-        _update_workspace_facts_from_root_entries(session, _parse_tree_root_entries(tree_text))
+        _update_workspace_facts_from_root_entries(session, parse_root_entries_from_tree(tree_text))
     for agent_name in AGENT_FILE_NAMES:
         session.attempted_agent_paths.add(normalize_repo_path(f"/{agent_name}"))
     _read_first_available(runtime, session, "/AGENTS.md")
@@ -387,43 +369,6 @@ def _emit_preflight_completion(payload: ReportTaskCompletion) -> None:
         print(f"- {CLI_BLUE}{ref}{CLI_CLR}")
 
 
-def _generic_completion_guard(payload: ReportTaskCompletion) -> str | None:
-    if payload.outcome != "OUTCOME_OK":
-        return None
-
-    generic_steps = {
-        "completed the requested work",
-        "completed the task",
-        "task completed",
-        "finished the task",
-    }
-    generic_messages = {
-        "task completed.",
-        "completed the requested work.",
-        "task completed",
-        "completed the requested work",
-    }
-    normalized_steps = {step.strip().lower() for step in payload.completed_steps_laconic if step.strip()}
-    normalized_message = payload.message.strip().lower()
-
-    if not payload.grounding_refs:
-        return (
-            "Do not report OUTCOME_OK without concrete grounding refs. "
-            "Ground the result in observed files or return clarification."
-        )
-    if not normalized_steps or normalized_steps <= generic_steps:
-        return (
-            "Do not report OUTCOME_OK with generic completed steps. "
-            "List the concrete work that was verified."
-        )
-    if normalized_message in generic_messages:
-        return (
-            "Do not report OUTCOME_OK with a generic completion message. "
-            "Summarize the concrete verified result."
-        )
-    return None
-
-
 def _command_signature(cmd: ToolRequest) -> str:
     return f"{cmd.__class__.__name__}:{json.dumps(cmd.model_dump(mode='json'), sort_keys=True)}"
 
@@ -530,50 +475,6 @@ def _local_fallback_command(session: AgentSessionState) -> ToolRequest | None:
 
     session.local_fallback_count += 1
     return sequence[min(index, len(sequence) - 1)]
-
-
-def _prepare_command(
-    runtime: PcmRuntimeAdapter,
-    session: AgentSessionState,
-    cmd: ToolRequest,
-) -> str | None:
-    for path in command_paths(cmd):
-        if is_mutating_command(cmd):
-            _ensure_agent_grounding(runtime, session, path)
-
-    guard = mutation_guard(session.task_text, cmd)
-    if guard:
-        print(f"{CLI_YELLOW}POLICY{CLI_CLR}: {guard}")
-        return guard
-
-    if isinstance(cmd, ReportTaskCompletion):
-        completion_guard = _generic_completion_guard(cmd)
-        if completion_guard:
-            print(f"{CLI_YELLOW}POLICY{CLI_CLR}: {completion_guard}")
-            return completion_guard
-
-    if isinstance(cmd, ReportTaskCompletion) and session.pending_verification_paths:
-        pending = ", ".join(sorted(session.pending_verification_paths))
-        message = (
-            f"Verification required before report_completion. "
-            f"Confirm final state for: {pending}"
-        )
-        print(f"{CLI_YELLOW}VERIFY{CLI_CLR}: {message}")
-        return message
-
-    return None
-
-
-def _update_verification_state(session: AgentSessionState, cmd: ToolRequest) -> None:
-    paths = command_paths(cmd)
-    if is_mutating_command(cmd):
-        for path in paths:
-            session.pending_verification_paths.add(normalize_repo_path(path))
-    elif is_verification_command(cmd):
-        session.pending_verification_paths = clear_verified_paths(
-            session.pending_verification_paths,
-            paths,
-        )
 
 
 def _extract_tool_body(text: str | None) -> str:
@@ -1034,6 +935,25 @@ def _parse_channel_status_request(
     return parse_channel_status_lookup_request(task_text, channel_statuses)
 
 
+def _read_named_channel_status_text(
+    runtime: PcmRuntimeAdapter,
+    session: AgentSessionState,
+    channel_name: str,
+) -> tuple[str | None, str | None]:
+    desired = channel_name.strip().lower()
+    for name in _list_names(runtime, session, "/docs/channels"):
+        if not name.lower().endswith(".txt"):
+            continue
+        stem = name[:-4]
+        if stem.lower() == "otp":
+            continue
+        if stem.lower() != desired:
+            continue
+        path = f"/docs/channels/{name}"
+        return path, _read_text(runtime, session, path)
+    return None, None
+
+
 def _handle_knowledge_repo_inbox_security(
     runtime: PcmRuntimeAdapter,
     session: AgentSessionState,
@@ -1067,130 +987,6 @@ def _handle_knowledge_repo_inbox_security(
     )
     _answer_and_stop(runtime, payload)
     return True
-
-
-def _parse_thread_discard_target(task_text: str) -> str | None:
-    match = re.search(r"discard thread ([^.\n]+?) entirely", task_text, re.IGNORECASE)
-    if match is None:
-        return None
-    name = match.group(1).strip().strip("'\"")
-    if not name.endswith(".md"):
-        name = f"{name}.md"
-    return name
-
-
-def _parse_explicit_capture_request(task_text: str) -> tuple[str, str | None] | None:
-    match = re.search(
-        r"take\s+(00_inbox/\S+)\s+from inbox,\s+capture it into(?:\s+into)?\s+'([^']+)'\s+folder",
-        task_text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return f"/{match.group(1).lstrip('/')}", match.group(2).strip()
-
-
-def _parse_email_lookup_target(task_text: str) -> str | None:
-    match = re.search(r"email address of (.+?)(?:\?|$)", task_text, re.IGNORECASE)
-    if match is None:
-        return None
-    return match.group(1).strip().strip("'\"")
-
-
-def _parse_invoice_creation_request(task_text: str) -> tuple[str, list[dict[str, int]]] | None:
-    header = re.search(r"create invoice (\S+) with \d+ lines?:\s*(.+)$", task_text, re.IGNORECASE)
-    if header is None:
-        return None
-
-    invoice_number = header.group(1).strip().rstrip(".,")
-    lines_blob = header.group(2)
-    line_matches = re.findall(r"'([^']+)'\s*-\s*(\d+)", lines_blob)
-    if not line_matches:
-        return None
-    return (
-        invoice_number,
-        [{"name": name.strip(), "amount": int(amount)} for name, amount in line_matches],
-    )
-
-
-def _parse_two_week_followup_account(task_text: str) -> str | None:
-    match = re.search(r"^(.+?) asked to reconnect in two weeks", task_text, re.IGNORECASE)
-    if match is None:
-        return None
-    return match.group(1).strip()
-
-
-def _parse_followup_reschedule_request(task_text: str) -> tuple[str, str] | None:
-    exact_match = re.search(
-        r"^(.+?) asked to move the next follow-up to (\d{4}-\d{2}-\d{2})",
-        task_text,
-        re.IGNORECASE,
-    )
-    if exact_match is not None:
-        return exact_match.group(1).strip(), exact_match.group(2)
-
-    account_name = _parse_two_week_followup_account(task_text)
-    if account_name is None:
-        return None
-    return account_name, ""
-
-
-def _parse_primary_contact_email_account(task_text: str) -> str | None:
-    match = re.search(
-        r"primary contact for (.+?)(?:\s+account)?(?:\?|$)",
-        task_text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return match.group(1).strip().strip("'\"")
-
-
-def _parse_account_manager_email_account(task_text: str) -> str | None:
-    match = re.search(
-        r"account manager for (.+?)(?:\s+account)?(?:\?|$)",
-        task_text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return match.group(1).strip().strip("'\"")
-
-
-def _parse_manager_account_listing_request(task_text: str) -> str | None:
-    match = re.search(
-        r"which accounts are managed by (.+?)(?:\?|$)",
-        task_text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return match.group(1).strip().strip("'\"")
-
-
-def _parse_legal_name_account_request(task_text: str) -> str | None:
-    match = re.search(
-        r"exact legal name of (.+?)(?:\s+account)?(?:\?|$)",
-        task_text,
-        re.IGNORECASE,
-    )
-    if match is None:
-        return None
-    return match.group(1).strip().strip("'\"")
-
-
-def _parse_direct_capture_snippet_request(task_text: str) -> tuple[str, str, str] | None:
-    match = re.search(
-        r"capture this snippet from website\s+(\S+)\s+into\s+(\S+):\s+\"(.*)\"\s*$",
-        task_text,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if match is None:
-        return None
-    domain = match.group(1).strip().rstrip(".,")
-    target_path = f"/{match.group(2).strip().lstrip('/')}"
-    snippet = match.group(3)
-    return domain, normalize_repo_path(target_path), snippet
 
 
 def _current_repo_date(
@@ -1263,7 +1059,7 @@ def _build_capture_markdown(source_text: str) -> tuple[str, str, str]:
     source_url = source_url_match.group(1).strip() if source_url_match else ""
     raw_text = source_text.split("Raw text:\n", 1)[1].strip() if "Raw text:\n" in source_text else source_text.strip()
 
-    why_keep = "it captures a concrete shift in how AI-generated polish changes trust and abuse patterns online"
+    why_keep = "it preserves a concrete external input worth later review, distillation, or comparison"
     capture_text = (
         f"# {title}\n\n"
         f"- **Source URL:** {source_url}\n"
@@ -1275,27 +1071,30 @@ def _build_capture_markdown(source_text: str) -> tuple[str, str, str]:
     return title, captured_on, capture_text
 
 
-def _build_card_markdown(
-    card_title: str,
-    card_date: str,
-    capture_path: str,
-) -> str:
-    return (
-        f"# {card_title}\n\n"
-        f"- **Source:** [{capture_path}]({capture_path})\n"
-        f"- **Date:** {card_date}\n"
-        "- **People:** Hacker News discussion\n"
-        "- **Topics:** vibe coding, spam, phishing, trust signals, AI-generated design\n\n"
-        "## Key Points\n"
-        "- Low-friction AI tooling raises the baseline for polished spam and phishing design.\n"
-        "- Older visual heuristics for spotting fake messages get weaker when mediocre attackers can ship cleaner-looking artifacts.\n"
-        "- The thread adds that distribution, incentives, and filtering matter alongside generation quality.\n\n"
-        "## Why this matters for current work\n"
-        "- This is a useful reminder that visual polish is no longer a strong trust signal once AI-generated defaults become cheap and common.\n\n"
-        "<!-- AGENT_EDITABLE_START:reflection -->\n"
-        "- Generic AI polish can become a trust smell once enough low-effort abuse converges on the same visual patterns.\n"
-        "<!-- AGENT_EDITABLE_END:reflection -->\n"
-    )
+def _extract_capture_note_lines(text: str) -> list[str]:
+    body = text.split("Raw text:\n", 1)[1] if "Raw text:\n" in text else text
+    lines: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^(Captured on|Source URL):", line, re.IGNORECASE):
+            continue
+        if line.startswith(("- ", "* ")):
+            line = line[2:].strip()
+        line = re.sub(r"\s+", " ", line)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def _derive_capture_card_title(source_title: str) -> str:
+    normalized = source_title.strip()
+    if not normalized:
+        return "Capture review"
+    if ":" in normalized:
+        return normalized
+    return f"Capture: {normalized}"
 
 
 def _derive_capture_title_from_path(path: str) -> str:
@@ -1332,7 +1131,7 @@ def _build_generic_capture_card_markdown(
     capture_path: str,
     snippet: str,
 ) -> str:
-    lines = [line.strip() for line in snippet.splitlines() if line.strip()]
+    lines = _extract_capture_note_lines(snippet)
     points = lines[:3] or ["The captured snippet is preserved for later distillation."]
     bullet_text = "\n".join(f"- {line.rstrip('.') }." if not line.endswith((".", "!", "?")) else f"- {line}" for line in points)
     return (
@@ -1340,11 +1139,11 @@ def _build_generic_capture_card_markdown(
         f"- **Source:** [{capture_path}]({capture_path})\n"
         f"- **Date:** {card_date}\n"
         "- **People:** Unknown\n"
-        "- **Topics:** agent tooling, prompts, evals, review loops\n\n"
+        "- **Topics:** captured source, distillation, review notes\n\n"
         "## Key Points\n"
         f"{bullet_text}\n\n"
         "## Why this matters for current work\n"
-        "- This capture is a reusable prompt-and-review workflow reference.\n"
+        "- This capture preserves reusable source material for later review, synthesis, or retrieval.\n"
     )
 
 
@@ -1450,15 +1249,17 @@ def _handle_knowledge_repo_capture(
     basename = inbox_path.rsplit("/", 1)[-1]
     capture_path = f"/01_capture/{bucket}/{basename}"
     card_path = f"/02_distill/cards/{basename}"
-    thread_path = "/02_distill/threads/2026-03-23__agent-platforms-and-runtime.md"
+    thread_path = _choose_thread_path(runtime, session, f"{session.task_text}\n\n{source_text}")
+    if thread_path is None:
+        return False
 
     source_title, card_date, capture_markdown = _build_capture_markdown(source_text)
-    card_title = "Hacker News: vibe-coded spam raises the baseline for phishing polish"
-    card_markdown = _build_card_markdown(card_title, card_date, capture_path)
+    card_title = _derive_capture_card_title(source_title)
+    card_markdown = _build_generic_capture_card_markdown(card_title, card_date, capture_path, source_text)
     thread_text = _read_text(runtime, session, thread_path)
     if thread_text is None:
         return False
-    thread_line = f"- NEW: [{card_date} {card_title}](/02_distill/cards/{basename})"
+    thread_line = f"- NEW: [{card_date} {card_title}]({card_path})"
     updated_thread = thread_text if thread_line in thread_text else f"{thread_text.rstrip()}\n{thread_line}\n"
 
     if not _run_write_text(runtime, session, capture_path, capture_markdown):
@@ -1893,9 +1694,6 @@ def _handle_typed_crm_inbox(
     if message_text is None:
         return False
 
-    channel_agents_text = _read_text(runtime, session, "/docs/channels/AGENTS.MD") or ""
-    discord_text = _read_text(runtime, session, "/docs/channels/Discord.txt") or ""
-    telegram_text = _read_text(runtime, session, "/docs/channels/Telegram.txt") or ""
     otp_text = _read_text(runtime, session, "/docs/channels/otp.txt") or ""
 
     email_message = parse_email_inbox_message(message_text)
@@ -2021,9 +1819,8 @@ def _handle_typed_crm_inbox(
     if channel_message is None:
         return False
 
-    channel_statuses = parse_channel_statuses(
-        telegram_text if channel_message.channel.lower() == "telegram" else discord_text
-    )
+    channel_doc_path, channel_doc_text = _read_named_channel_status_text(runtime, session, channel_message.channel)
+    channel_statuses = parse_channel_statuses(channel_doc_text or "")
     trust = channel_statuses.get(channel_message.handle.lower(), "unknown")
     elevated_by_otp = False
     otp_token = channel_message.otp
@@ -2037,7 +1834,7 @@ def _handle_typed_crm_inbox(
             tool="report_completion",
             completed_steps_laconic=["Read channel inbox message", "Detected blacklisted handle"],
             message="This message came from a blacklisted channel handle and was denied.",
-            grounding_refs=[msg_path, "/docs/channels/AGENTS.MD"],
+            grounding_refs=[msg_path, channel_doc_path or "/docs/channels/AGENTS.MD"],
             outcome="OUTCOME_DENIED_SECURITY",
         )
         _answer_and_stop(runtime, payload)
@@ -2048,7 +1845,7 @@ def _handle_typed_crm_inbox(
             tool="report_completion",
             completed_steps_laconic=["Read channel inbox message", "Detected untrusted unknown handle"],
             message="This message came from an unknown untrusted channel and was denied.",
-            grounding_refs=[msg_path, "/docs/channels/AGENTS.MD"],
+            grounding_refs=[msg_path, channel_doc_path or "/docs/channels/AGENTS.MD"],
             outcome="OUTCOME_DENIED_SECURITY",
         )
         _answer_and_stop(runtime, payload)
@@ -2059,7 +1856,7 @@ def _handle_typed_crm_inbox(
             tool="report_completion",
             completed_steps_laconic=["Read channel inbox message", "Detected non-trusted valid handle"],
             message="This message came from a non-trusted valid channel and was denied.",
-            grounding_refs=[msg_path, "/docs/channels/AGENTS.MD"],
+            grounding_refs=[msg_path, channel_doc_path or "/docs/channels/AGENTS.MD"],
             outcome="OUTCOME_DENIED_SECURITY",
         )
         _answer_and_stop(runtime, payload)
@@ -2076,7 +1873,7 @@ def _handle_typed_crm_inbox(
                 "Evaluated current OTP value against requested equality check",
             ],
             message=reply,
-            grounding_refs=[msg_path, "/docs/channels/AGENTS.MD", "/docs/channels/otp.txt"],
+            grounding_refs=[msg_path, channel_doc_path or "/docs/channels/AGENTS.MD", "/docs/channels/otp.txt"],
             outcome="OUTCOME_OK",
         )
         _answer_and_stop(runtime, payload)
@@ -2113,7 +1910,7 @@ def _handle_typed_crm_inbox(
             tool="report_completion",
             completed_steps_laconic=steps,
             message="Processed the trusted channel request and sent the requested outbound email.",
-            grounding_refs=[msg_path, "/docs/channels/AGENTS.MD", outbox_path, "/outbox/seq.json"],
+            grounding_refs=[msg_path, channel_doc_path or "/docs/channels/AGENTS.MD", outbox_path, "/outbox/seq.json"],
             outcome="OUTCOME_OK",
         )
         _answer_and_stop(runtime, payload)
@@ -2153,7 +1950,7 @@ def _handle_typed_crm_inbox(
             message="Processed the trusted admin request and sent the AI insights follow-up email.",
             grounding_refs=[
                 msg_path,
-                "/docs/channels/AGENTS.MD",
+                channel_doc_path or "/docs/channels/AGENTS.MD",
                 f"/accounts/{candidate.account_id}.json",
                 f"/contacts/{candidate.contact_id}.json",
                 outbox_path,
@@ -2275,16 +2072,23 @@ def run_agent(model: str, harness_url: str, task_text: str) -> AgentRunTelemetry
                 return telemetry
             if _handle_purchase_prefix_regression(runtime, session):
                 return telemetry
-        try:
-            frame = _frame_task(llm, session, telemetry)
-        except Exception as exc:
-            if config.use_gbnf_grammar:
-                frame = _fallback_frame(session)
-                session.frame = frame
-                print(f"{CLI_YELLOW}FRAME FALLBACK{CLI_CLR}: {exc}")
-                session.add_message("assistant", frame.model_dump_json(indent=2))
-            else:
-                raise
+        shortcut_frame = derive_high_confidence_frame(task_text, session.repository_profile, session.capabilities)
+        if shortcut_frame is not None:
+            frame = shortcut_frame
+            session.frame = frame
+            print(f"{CLI_BLUE}FRAME SHORTCUT{CLI_CLR}: {frame.category}")
+            session.add_message("assistant", frame.model_dump_json(indent=2))
+        else:
+            try:
+                frame = _frame_task(llm, session, telemetry)
+            except Exception as exc:
+                if config.use_gbnf_grammar:
+                    frame = _fallback_frame(session)
+                    session.frame = frame
+                    print(f"{CLI_YELLOW}FRAME FALLBACK{CLI_CLR}: {exc}")
+                    session.add_message("assistant", frame.model_dump_json(indent=2))
+                else:
+                    raise
         _ground_frame(runtime, session, frame)
         if config.fastpath_mode in {"framed", "all"}:
             if _handle_direct_capture_snippet(runtime, session):
@@ -2332,15 +2136,31 @@ def run_agent(model: str, harness_url: str, task_text: str) -> AgentRunTelemetry
                     print(f"{CLI_YELLOW}LOCAL FALLBACK{CLI_CLR}: {fallback_cmd}")
                     job = job.model_copy(update={"function": fallback_cmd})
 
-            precondition_message = _prepare_command(runtime, session, job.function)
+            for path in command_paths(job.function):
+                if is_mutating_command(job.function):
+                    _ensure_agent_grounding(runtime, session, path)
+
+            precondition_message = prepare_command(
+                session.task_text,
+                session.pending_verification_paths,
+                job.function,
+            )
             if precondition_message is not None:
                 txt = precondition_message
+                if isinstance(job.function, ReportTaskCompletion):
+                    label = "VERIFY" if session.pending_verification_paths else "POLICY"
+                    print(f"{CLI_YELLOW}{label}{CLI_CLR}: {precondition_message}")
+                else:
+                    print(f"{CLI_YELLOW}POLICY{CLI_CLR}: {precondition_message}")
                 _reset_repeated_failure_state(session)
             else:
                 try:
                     txt = runtime.execute(job.function)
                     print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt}")
-                    _update_verification_state(session, job.function)
+                    session.pending_verification_paths = next_pending_verification_paths(
+                        session.pending_verification_paths,
+                        job.function,
+                    )
                     _reset_repeated_failure_state(session)
                 except ConnectError as exc:
                     txt = str(exc.message)

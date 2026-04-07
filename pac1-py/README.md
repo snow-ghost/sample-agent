@@ -25,3 +25,11 @@ Useful environment overrides:
 - `BENCHMARK_HOST` defaults to `https://api.bitgn.com`
 - `BENCHMARK_ID` defaults to `bitgn/pac1-dev`
 - `MODEL_ID` defaults to `gpt-4.1-2025-04-14`
+
+Generalization and scorer-blind development docs:
+
+- `docs/agent-generalization-plan.md`
+- `docs/future-benchmark-signals.md`
+- `docs/runtime-log-analysis.md`
+- `docs/failure-taxonomy.md`
+- `evals/scorer-blind-corpus.md`

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import shlex
+import time
 from typing import Any
 
+from connectrpc.code import Code
+from connectrpc.errors import ConnectError
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest,
@@ -43,6 +46,13 @@ OUTCOME_BY_NAME = {
     "OUTCOME_NONE_CLARIFICATION": Outcome.OUTCOME_NONE_CLARIFICATION,
     "OUTCOME_NONE_UNSUPPORTED": Outcome.OUTCOME_NONE_UNSUPPORTED,
     "OUTCOME_ERR_INTERNAL": Outcome.OUTCOME_ERR_INTERNAL,
+}
+
+TRANSIENT_CONNECT_CODES = {
+    Code.UNAVAILABLE,
+    Code.INTERNAL,
+    Code.UNKNOWN,
+    Code.DEADLINE_EXCEEDED,
 }
 
 
@@ -130,6 +140,28 @@ def format_result(cmd: ToolRequest, result: Any) -> str:
 class PcmRuntimeAdapter:
     def __init__(self, harness_url: str) -> None:
         self.client = PcmRuntimeClientSync(harness_url)
+        self.retry_attempts = 2
+        self.retry_delay_seconds = 0.2
+
+    def _is_transient_error(self, exc: Exception) -> bool:
+        if isinstance(exc, ConnectError):
+            return exc.code in TRANSIENT_CONNECT_CODES
+        message = str(exc).lower()
+        return any(marker in message for marker in ("bad gateway", "502", "gateway timeout", "temporarily unavailable"))
+
+    def _dispatch_with_retry(self, cmd: ToolRequest) -> Any:
+        attempts = self.retry_attempts + 1
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                return self.dispatch(cmd)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts - 1 or not self._is_transient_error(exc):
+                    raise
+                time.sleep(self.retry_delay_seconds)
+        assert last_exc is not None
+        raise last_exc
 
     def dispatch(self, cmd: ToolRequest) -> Any:
         if isinstance(cmd, Req_Context):
@@ -186,4 +218,4 @@ class PcmRuntimeAdapter:
         raise ValueError(f"Unknown command: {cmd}")
 
     def execute(self, cmd: ToolRequest) -> str:
-        return format_result(cmd, self.dispatch(cmd))
+        return format_result(cmd, self._dispatch_with_retry(cmd))
