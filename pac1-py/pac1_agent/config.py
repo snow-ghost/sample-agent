@@ -13,6 +13,7 @@ class AgentConfig:
     openai_base_url: str | None
     max_steps: int = 30
     max_tokens: int = 4096
+    request_timeout_seconds: float = 60.0
     json_repair_retries: int = 2
     use_gbnf_grammar: bool = False
     fastpath_mode: Literal["off", "framed", "all"] = "framed"
@@ -34,6 +35,7 @@ class AgentConfig:
             openai_base_url=base_url,
             max_steps=int(os.getenv("AGENT_MAX_STEPS", "30")),
             max_tokens=int(os.getenv("AGENT_MAX_TOKENS", "4096")),
+            request_timeout_seconds=float(os.getenv("AGENT_REQUEST_TIMEOUT_SECONDS", "60")),
             json_repair_retries=int(os.getenv("AGENT_JSON_REPAIR_RETRIES", "2")),
             use_gbnf_grammar=use_gbnf,
             fastpath_mode=fastpath_mode,  # type: ignore[arg-type]

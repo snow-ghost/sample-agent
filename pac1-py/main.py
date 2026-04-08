@@ -7,7 +7,17 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from bitgn.harness_connect import HarnessServiceClientSync
-from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
+from bitgn.harness_pb2 import (
+    EndTrialRequest,
+    EvalPolicy,
+    GetBenchmarkRequest,
+    RunState,
+    StartPlaygroundRequest,
+    StartRunRequest,
+    StartTrialRequest,
+    SubmitRunRequest,
+    StatusRequest,
+)
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
@@ -16,6 +26,8 @@ from pac1_agent.telemetry import AgentRunTelemetry
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 MODEL_ID = os.getenv("MODEL_ID") or "gpt-4.1-2025-04-14"
+BITGN_API_KEY = os.getenv("BITGN_API_KEY")
+BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME") or "pac1-py-run"
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -171,17 +183,36 @@ def _run_benchmark(task_filter: list[str]) -> None:
             f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
 
-        for task in res.tasks:
-            if task_filter and task.task_id not in task_filter:
-                continue
-
-            print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
-            trial = client.start_playground(
-                StartPlaygroundRequest(
+        if task_filter:
+            tasks = [task for task in res.tasks if task.task_id in set(task_filter)]
+            print(f"Running {len(tasks)} filtered tasks via playground")
+        else:
+            run_response = client.start_run(
+                StartRunRequest(
                     benchmark_id=BENCHMARK_ID,
-                    task_id=task.task_id,
+                    name=BITGN_RUN_NAME,
+                    api_key=BITGN_API_KEY,
                 )
             )
+            trial_ids = list(run_response.trial_ids)
+            tasks = list(res.tasks)
+            if len(trial_ids) < len(tasks):
+                print(f"start_run returned only {len(trial_ids)} trial ids, expected {len(tasks)}")
+            print(f"Running leaderboard run {run_response.run_id} for {len(tasks)} tasks")
+
+        for idx, task in enumerate(tasks):
+            if task_filter:
+                print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
+                trial = client.start_playground(
+                    StartPlaygroundRequest(
+                        benchmark_id=BENCHMARK_ID,
+                        task_id=task.task_id,
+                    )
+                )
+            else:
+                trial_id = run_response.trial_ids[idx]
+                print(f"{'=' * 30} Starting task: {task.task_id} / {trial_id} {'=' * 16}")
+                trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
 
             print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
 
@@ -227,37 +258,44 @@ def _run_benchmark(task_filter: list[str]) -> None:
         print("\nSummary:")
         print(_render_summary_table(task_rows))
 
-        total = sum(score for _, score in scores) / len(scores) * 100.0
-        totals = _build_totals(task_rows, total)
-        print(f"FINAL: {total:0.2f}%")
-        print(
-            "TOTALS: "
-            f"tasks={totals['tasks_run']}, "
-            f"passed={totals['tasks_passed']}, "
-            f"failed={totals['tasks_failed']}, "
-            f"wall={totals['wall_time_ms']} ms, "
-            f"llm_calls={totals['llm_calls']}, "
-            f"llm_time={totals['llm_time_ms']} ms, "
-            f"tokens={totals['total_tokens']} "
-            f"(prompt={totals['prompt_tokens']}, completion={totals['completion_tokens']})"
-        )
-        print(
-            "AVERAGES: "
-            f"wall={totals['avg_wall_time_ms']:.2f} ms/task, "
-            f"llm_calls={totals['avg_llm_calls_per_task']:.2f}/task, "
-            f"llm_time={totals['avg_llm_time_ms']:.2f} ms/task, "
-            f"tokens={totals['avg_tokens_per_task']:.2f}/task, "
-            f"llm_tasks={totals['llm_tasks_run']}, "
-            f"llm_time_when_used={totals['avg_llm_time_ms_when_used']:.2f} ms, "
-            f"tokens_when_used={totals['avg_tokens_when_used']:.2f}"
-        )
-        if not task_filter or os.getenv("SAVE_PARTIAL_METRICS") == "1":
-            json_path, csv_path = _save_metrics(task_rows, total)
-            print(f"METRICS_JSON: {json_path}")
-            print(f"METRICS_CSV: {csv_path}")
+    total = sum(score for _, score in scores) / len(scores) * 100.0
+    totals = _build_totals(task_rows, total)
+    print(f"FINAL: {total:0.2f}%")
+    if not task_filter:
+        submit_response = client.submit_run(SubmitRunRequest(run_id=run_response.run_id))
+        if isinstance(submit_response.state, int):
+            state_text = RunState.Name(submit_response.state)
         else:
-            print("METRICS_JSON: skipped for partial run")
-            print("METRICS_CSV: skipped for partial run")
+            state_text = submit_response.state.name
+        print(f"SubmitRun state={state_text}")
+    print(
+        "TOTALS: "
+        f"tasks={totals['tasks_run']}, "
+        f"passed={totals['tasks_passed']}, "
+        f"failed={totals['tasks_failed']}, "
+        f"wall={totals['wall_time_ms']} ms, "
+        f"llm_calls={totals['llm_calls']}, "
+        f"llm_time={totals['llm_time_ms']} ms, "
+        f"tokens={totals['total_tokens']} "
+        f"(prompt={totals['prompt_tokens']}, completion={totals['completion_tokens']})"
+    )
+    print(
+        "AVERAGES: "
+        f"wall={totals['avg_wall_time_ms']:.2f} ms/task, "
+        f"llm_calls={totals['avg_llm_calls_per_task']:.2f}/task, "
+        f"llm_time={totals['avg_llm_time_ms']:.2f} ms/task, "
+        f"tokens={totals['avg_tokens_per_task']:.2f}/task, "
+        f"llm_tasks={totals['llm_tasks_run']}, "
+        f"llm_time_when_used={totals['avg_llm_time_ms_when_used']:.2f} ms, "
+        f"tokens_when_used={totals['avg_tokens_when_used']:.2f}"
+    )
+    if not task_filter or os.getenv("SAVE_PARTIAL_METRICS") == "1":
+        json_path, csv_path = _save_metrics(task_rows, total)
+        print(f"METRICS_JSON: {json_path}")
+        print(f"METRICS_CSV: {csv_path}")
+    else:
+        print("METRICS_JSON: skipped for partial run")
+        print("METRICS_CSV: skipped for partial run")
 
 
 def main() -> None:

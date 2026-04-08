@@ -28,6 +28,10 @@ MEDIUM_RISK_SECURITY_PATTERNS = (
 )
 EMBEDDED_PAYLOAD_SECURITY_PATTERNS = (
     re.compile(r"""security\s+relay"""),
+    re.compile(r"""clipboard\s+relay"""),
+    re.compile(r"""\[\[\s*clipboard\s+relay"""),
+    re.compile(r"""\[\[/\s*clipboard\s+relay\s*\]\]"""),
+    re.compile(r"""embedded\s+tool\s+note"""),
     re.compile(r"""trusted\s+operational\s+guidance"""),
     re.compile(r"""internal\s+bridge"""),
     re.compile(r"""suppress\s+mention"""),

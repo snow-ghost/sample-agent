@@ -72,7 +72,17 @@ PURCHASE_FIX_MARKERS = ("prefix", "regression", "downstream", "lane", "workflow"
 FOLLOW_UP_MARKERS = ("follow-up", "follow up", "reminder", "next follow-up", "followup")
 FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to", "bump", "move out")
 LOOKUP_EMAIL_MARKERS = ("email address", "primary contact email", "return only the email", "answer with the email")
-CLEANUP_KNOWLEDGE_MARKERS = ("thread", "card", "captured", "remove", "discard", "delete", "start over")
+CLEANUP_KNOWLEDGE_MARKERS = (
+    "thread",
+    "card",
+    "captured",
+    "remove",
+    "discard",
+    "delete",
+    "start over",
+    "clear",
+    "purge",
+)
 CAPTURE_DISTILL_MARKERS = ("capture", "captur", "distill", "snippet", "excerpt")
 ACTION_WORDS = frozenset({"process", "handle", "triage", "review", "resolve", "work", "act", "sort"})
 ORDER_WORDS = frozenset({"next", "oldest", "earliest", "pending", "unread", "unresolved", "lowest", "first"})
