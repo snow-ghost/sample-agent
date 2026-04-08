@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import re
 
 from .capabilities import extract_task_intent
+from .pathing import normalize_repo_path
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,12 @@ class ContactCandidate:
 class ChannelStatusRequest:
     channel_name: str
     status: str
+
+
+@dataclass(frozen=True)
+class CrmLookupRequest:
+    kind: str
+    target: str
 
 
 def parse_email_inbox_message(text: str) -> EmailInboxMessage | None:
@@ -77,11 +84,175 @@ def parse_requested_invoice_account(text: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
+def parse_thread_discard_target(task_text: str) -> str | None:
+    match = re.search(r"discard thread ([^.\n]+?) entirely", task_text, re.IGNORECASE)
+    if match is None:
+        return None
+    name = match.group(1).strip().strip("'\"")
+    if not name.endswith(".md"):
+        name = f"{name}.md"
+    return name
+
+
+def parse_explicit_capture_request(task_text: str) -> tuple[str, str | None] | None:
+    match = re.search(
+        r"take\s+(00_inbox/\S+)\s+from inbox,\s+capture it into(?:\s+into)?\s+'([^']+)'\s+folder",
+        task_text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return f"/{match.group(1).lstrip('/')}", match.group(2).strip()
+
+
+def parse_email_lookup_target(task_text: str) -> str | None:
+    return _extract_first_target(
+        task_text,
+        (
+            r"email address of (.+?)(?:[?.]|$)",
+            r"(?:email|address) for (.+?)(?:[?.]|$)",
+            r"(?:what(?:'s| is)|give me|share)\s+(.+?)'s\s+email(?:\s+address)?(?:[?.]|$)",
+        ),
+    )
+
+
+def parse_invoice_creation_request(task_text: str) -> tuple[str, list[dict[str, int]]] | None:
+    header = re.search(r"create invoice (\S+) with \d+ lines?:\s*(.+)$", task_text, re.IGNORECASE)
+    if header is None:
+        return None
+
+    invoice_number = header.group(1).strip().rstrip(".,")
+    lines_blob = header.group(2)
+    line_matches = re.findall(r"'([^']+)'\s*-\s*(\d+)", lines_blob)
+    if not line_matches:
+        return None
+    return (
+        invoice_number,
+        [{"name": name.strip(), "amount": int(amount)} for name, amount in line_matches],
+    )
+
+
+def parse_two_week_followup_account(task_text: str) -> str | None:
+    match = re.search(r"^(.+?) asked to reconnect in two weeks", task_text, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def parse_followup_reschedule_request(task_text: str) -> tuple[str, str] | None:
+    for pattern in (
+        r"^(.+?) asked to move the next follow-up to (\d{4}-\d{2}-\d{2})",
+        r"^set the next (?:follow-up|touchpoint) with (.+?) to (\d{4}-\d{2}-\d{2})",
+        r"^reschedule the (?:follow-up|reminder|touchpoint) for (.+?) to (\d{4}-\d{2}-\d{2})",
+        r"^move the next (?:follow-up|touchpoint) with (.+?) to (\d{4}-\d{2}-\d{2})",
+        r"^bump the next (?:follow-up|touchpoint) with (.+?) to (\d{4}-\d{2}-\d{2})",
+        r"^move the (?:reminder|touchpoint) for (.+?) out to (\d{4}-\d{2}-\d{2})",
+    ):
+        exact_match = re.search(pattern, task_text, re.IGNORECASE)
+        if exact_match is not None:
+            return exact_match.group(1).strip(), exact_match.group(2)
+
+    account_name = parse_two_week_followup_account(task_text)
+    if account_name is None:
+        return None
+    return account_name, ""
+
+
+def parse_primary_contact_email_account(task_text: str) -> str | None:
+    return _extract_first_target(
+        task_text,
+        (
+            r"primary contact for (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address) (?:for|of) (?:the )?(?:primary|main) contact (?:for|on) (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address) (?:for|of) (?:the )?(?:primary|main) stakeholder (?:for|on) (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address) (?:for|of) the point of contact (?:for|on) (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:what(?:'s| is)|give me|share)\s+the\s+(?:email|address)\s+for\s+the\s+(?:primary|main)\s+contact\s+(?:for|on)\s+(.+?)(?:\s+account)?(?:[?.]|$)",
+        ),
+    )
+
+
+def parse_account_manager_email_account(task_text: str) -> str | None:
+    return _extract_first_target(
+        task_text,
+        (
+            r"account manager for (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address).*?(?:account manager|account lead|lead) (?:for|on) (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address) (?:for|of) whoever manages (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:email|address) (?:for|of) whoever owns (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:what(?:'s| is)|give me|share)\s+the\s+(?:email|address)\s+for\s+whoever manages\s+(.+?)(?:\s+account)?(?:[?.]|$)",
+            r"(?:what(?:'s| is)|give me|share)\s+the\s+(?:email|address)\s+for\s+whoever owns\s+(.+?)(?:\s+account)?(?:[?.]|$)",
+        ),
+    )
+
+
+def parse_manager_account_listing_request(task_text: str) -> str | None:
+    return _extract_first_target(
+        task_text,
+        (
+            r"which accounts are managed by (.+?)(?:[?.]|$)",
+            r"which accounts does (.+?) manage(?:[?.]|$)",
+            r"list the accounts under (.+?)(?:[?.]|$)",
+            r"what accounts are under (.+?)(?:[?.]|$)",
+            r"which accounts belong to (.+?) as account manager(?:[?.]|$)",
+        ),
+    )
+
+
+def parse_legal_name_account_request(task_text: str) -> str | None:
+    return _extract_first_target(
+        task_text,
+        (
+            r"exact legal name of (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"formal company name of (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"legal entity name of (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"registered company name of (.+?)(?:\s+account)?(?:[?.]|$)",
+            r"corporate name of (.+?)(?:\s+account)?(?:[?.]|$)",
+        ),
+    )
+
+
+def parse_crm_lookup_request(task_text: str) -> CrmLookupRequest | None:
+    parsers = (
+        ("legal_name", parse_legal_name_account_request),
+        ("primary_contact_email", parse_primary_contact_email_account),
+        ("manager_email", parse_account_manager_email_account),
+        ("managed_accounts", parse_manager_account_listing_request),
+        ("contact_email", parse_email_lookup_target),
+    )
+    for kind, parser in parsers:
+        target = parser(task_text)
+        if target is not None:
+            return CrmLookupRequest(kind=kind, target=target)
+    return None
+
+
+def parse_direct_capture_snippet_request(task_text: str) -> tuple[str, str, str] | None:
+    match = re.search(
+        r"capture this snippet from website\s+(\S+)\s+into\s+(\S+):\s+\"(.*)\"\s*$",
+        task_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return None
+    domain = match.group(1).strip().rstrip(".,")
+    target_path = f"/{match.group(2).strip().lstrip('/')}"
+    snippet = match.group(3)
+    return domain, normalize_repo_path(target_path), snippet
+
+
 def _strip_matching_quotes(text: str) -> str:
     value = text.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
         return value[1:-1].strip()
     return value
+
+
+def _extract_first_target(task_text: str, patterns: tuple[str, ...]) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, task_text, re.IGNORECASE)
+        if match is not None:
+            return _strip_matching_quotes(match.group(1))
+    return None
 
 
 def parse_explicit_email_instruction(text: str) -> tuple[str, str, str] | None:

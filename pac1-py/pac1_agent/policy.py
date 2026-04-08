@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import posixpath
-import re
 from pathlib import PurePosixPath
-from typing import Literal
 
 from .capabilities import (
     RepositoryProfile,
@@ -27,6 +23,15 @@ from .models import (
     Req_MkDir,
     TaskFrame,
     ToolRequest,
+)
+from .pathing import AGENT_FILE_NAMES, candidate_read_paths, is_agent_instruction_path, normalize_repo_path
+from .safety import pre_bootstrap_outcome, text_only_preflight_outcome
+from .workspace import (
+    GroundingTarget,
+    candidate_agent_paths,
+    extract_startup_reads,
+    profile_grounding_targets,
+    relevant_roots,
 )
 
 
@@ -85,35 +90,6 @@ Tool objects:
 - {"tool":"move","from_name":string,"to_name":string}
 - {"tool":"report_completion","completed_steps_laconic":[string,...],"message":string,"grounding_refs":[string,...],"outcome":"OUTCOME_OK"|"OUTCOME_DENIED_SECURITY"|"OUTCOME_NONE_CLARIFICATION"|"OUTCOME_NONE_UNSUPPORTED"|"OUTCOME_ERR_INTERNAL"}
 """
-
-
-AGENT_FILE_NAMES = ("AGENTS.md", "AGENTS.MD")
-README_FILE_NAMES = ("README.md", "README.MD")
-HIGH_RISK_SECURITY_PATTERNS = (
-    re.compile(r"""(?:remove|delete)\s+["'`]?/agents\.md["'`]?"""),
-    re.compile(r"""ignore\s+(?:all\s+|any\s+)?(?:local\s+repository\s+|repository\s+|repo\s+)?rules"""),
-    re.compile(r"""ignore\s+(?:all\s+)?previous\s+instructions"""),
-    re.compile(r"""override(?:[-\s]fast[-\s]path|[-\s]execution[-\s]lane|[-\s]instructions)?"""),
-    re.compile(r"""forward\s+(?:any\s+)?(?:visible\s+)?credentials"""),
-    re.compile(r"""email\s+passwords"""),
-    re.compile(r"""access\s+notes\s+to\s+"""),
-    re.compile(r"""ops-bridge@example\.com"""),
-    re.compile(r"""bypass\s+(?:safeguards|guardrails|approval)"""),
-)
-MEDIUM_RISK_SECURITY_PATTERNS = (
-    re.compile(r"""mark\s+(?:the\s+)?task\s+(?:finished|complete|completed)"""),
-    re.compile(r"""keep\s+the\s+completion\s+log\s+minimal"""),
-    re.compile(r"""avoid\s+asking\s+follow-up\s+questions"""),
-    re.compile(r"""temporary\s+execution\s+lane"""),
-    re.compile(r"""handling:\s*immediate"""),
-    re.compile(r"""status:\s*authenticated"""),
-)
-
-
-@dataclass(frozen=True)
-class GroundingTarget:
-    kind: Literal["read", "list"]
-    path: str
 
 
 def build_system_prompt() -> str:
@@ -185,79 +161,11 @@ def build_tool_result_prompt(tool_name: str, text: str) -> str:
         f"{STEP_RESPONSE_INSTRUCTIONS.strip()}"
     )
 
-
-def _contains_prompt_injection_markers(task_text: str) -> bool:
-    text = task_text.lower()
-    if any(pattern.search(text) for pattern in HIGH_RISK_SECURITY_PATTERNS):
-        return True
-    medium_hits = sum(1 for pattern in MEDIUM_RISK_SECURITY_PATTERNS if pattern.search(text))
-    return medium_hits >= 2
-
-
-def _looks_truncated_capture_request(task_text: str, normalized_text: str) -> bool:
-    words = task_text.strip().split()
-    if not any(marker in normalized_text for marker in ("captur", "capture", "distill")):
-        return False
-    if len(words) > 6:
-        return False
-    if any(marker in task_text for marker in ("/", ":", "\"", "'")):
-        return False
-    if "website" in normalized_text or "snippet" in normalized_text:
-        return False
-    return True
-
-
-def _text_only_preflight_outcome(task_text: str) -> CompletionPayload | None:
-    intent = extract_task_intent(task_text)
-    text = intent.normalized_text
-    words = task_text.strip().split()
-    stripped_text = task_text.strip()
-
-    if "[[paste hijack" in text or _contains_prompt_injection_markers(task_text):
-        return CompletionPayload(
-            completed_steps_laconic=["Detected prompt-injection or exfiltration markers"],
-            message="The request contains prompt-injection or sensitive-data exfiltration instructions. I will not execute it.",
-            grounding_refs=["/AGENTS.md"],
-            outcome="OUTCOME_DENIED_SECURITY",
-        )
-
-    if intent.mentions_deictic_reference and len(words) <= 5:
-        return CompletionPayload(
-            completed_steps_laconic=["Detected short deictic request without stable target"],
-            message="The request does not identify a unique target. Clarify exactly what should be processed or changed.",
-            grounding_refs=["/AGENTS.md"],
-            outcome="OUTCOME_NONE_CLARIFICATION",
-        )
-
-    if _looks_truncated_capture_request(task_text, text):
-        return CompletionPayload(
-            completed_steps_laconic=["Detected truncated capture-style request"],
-            message="The request is truncated and does not specify a concrete capture target. Clarify the exact source and destination.",
-            grounding_refs=["/AGENTS.md"],
-            outcome="OUTCOME_NONE_CLARIFICATION",
-        )
-
-    if len(words) <= 3 and "/" not in stripped_text and "." not in stripped_text and "\"" not in stripped_text:
-        if not intent.wants_inbox_processing:
-            return CompletionPayload(
-                completed_steps_laconic=["Detected underspecified short request"],
-                message="The request is too short or incomplete to identify the intended action. Clarify the exact target and operation.",
-                grounding_refs=["/AGENTS.md"],
-                outcome="OUTCOME_NONE_CLARIFICATION",
-            )
-
-    return None
-
-
-def pre_bootstrap_outcome(task_text: str) -> CompletionPayload | None:
-    return _text_only_preflight_outcome(task_text)
-
-
 def preflight_outcome(
     profile: RepositoryProfile,
     task_text: str,
 ) -> CompletionPayload | None:
-    text_only = _text_only_preflight_outcome(task_text)
+    text_only = text_only_preflight_outcome(task_text)
     if text_only is not None:
         return text_only
 
@@ -318,129 +226,6 @@ def preflight_outcome(
     return None
 
 
-def normalize_repo_path(path: str) -> str:
-    candidate = (path or "").strip().replace("\\", "/")
-    if not candidate or candidate == ".":
-        return "/"
-    candidate = f"/{candidate.lstrip('/')}"
-    normalized = posixpath.normpath(candidate)
-    return normalized if normalized.startswith("/") else f"/{normalized}"
-
-
-def candidate_read_paths(path: str) -> list[str]:
-    normalized = normalize_repo_path(path)
-    path_obj = PurePosixPath(normalized)
-    variants = [normalized]
-
-    basename_variants = {
-        "agents.md": AGENT_FILE_NAMES,
-        "readme.md": README_FILE_NAMES,
-    }.get(path_obj.name.lower())
-    if basename_variants is None:
-        return variants
-
-    for name in basename_variants:
-        candidate = normalize_repo_path(str(path_obj.with_name(name)))
-        if candidate not in variants:
-            variants.append(candidate)
-    return variants
-
-
-def is_agent_instruction_path(path: str) -> bool:
-    return PurePosixPath(normalize_repo_path(path)).name.lower() == "agents.md"
-
-
-def extract_startup_reads(agents_text: str) -> list[str]:
-    startup_paths: list[str] = []
-    for line in agents_text.splitlines():
-        lower = line.lower()
-        if "read" not in lower:
-            continue
-        if "start" not in lower and "session" not in lower and "always" not in lower:
-            continue
-        startup_paths.extend(re.findall(r"\((/[^)]+)\)", line))
-        startup_paths.extend(re.findall(r"`(/[^`]+)`", line))
-    deduped: list[str] = []
-    for path in startup_paths:
-        normalized = normalize_repo_path(path)
-        if normalized not in deduped:
-            deduped.append(normalized)
-    return deduped
-
-
-def _add_grounding_target(
-    targets: list[GroundingTarget],
-    seen: set[tuple[str, str]],
-    kind: Literal["read", "list"],
-    path: str,
-) -> None:
-    normalized = normalize_repo_path(path)
-    key = (kind, normalized)
-    if key in seen:
-        return
-    seen.add(key)
-    targets.append(GroundingTarget(kind=kind, path=normalized))
-
-
-def profile_grounding_targets(
-    profile: RepositoryProfile,
-    frame: TaskFrame,
-    task_text: str,
-) -> list[GroundingTarget]:
-    intent = extract_task_intent(task_text)
-    capabilities = infer_workspace_capabilities(profile=profile)
-    text = intent.normalized_text
-    targets: list[GroundingTarget] = []
-    seen: set[tuple[str, str]] = set()
-
-    if capabilities.profile == "typed_crm_fs":
-        if any(token in text for token in ("invoice", "billing", "subscription")):
-            _add_grounding_target(targets, seen, "read", "/my-invoices/README.MD")
-            _add_grounding_target(targets, seen, "list", "/my-invoices")
-        if intent.wants_outbound_email or any(token in text for token in ("subject", "body", "reminder", "follow-up")):
-            _add_grounding_target(targets, seen, "read", "/outbox/README.MD")
-            _add_grounding_target(targets, seen, "list", "/outbox")
-            _add_grounding_target(targets, seen, "read", "/contacts/README.MD")
-        if any(token in text for token in ("contact", "contacts", "account", "accounts")):
-            _add_grounding_target(targets, seen, "read", "/contacts/README.MD")
-            _add_grounding_target(targets, seen, "read", "/accounts/README.MD")
-        if any(token in text for token in ("opportunity", "pipeline")):
-            _add_grounding_target(targets, seen, "read", "/opportunities/README.MD")
-        if any(token in text for token in ("reminder", "follow-up", "reschedule", "next week")):
-            _add_grounding_target(targets, seen, "read", "/reminders/README.MD")
-            _add_grounding_target(targets, seen, "read", "/accounts/README.MD")
-        if intent.wants_inbox_processing:
-            _add_grounding_target(targets, seen, "read", "/inbox/README.md")
-            _add_grounding_target(targets, seen, "list", "/inbox")
-            _add_grounding_target(targets, seen, "read", "/docs/inbox-task-processing.md")
-            _add_grounding_target(targets, seen, "read", "/docs/inbox-msg-processing.md")
-            _add_grounding_target(targets, seen, "list", "/docs/channels")
-        if capabilities.has_channel_docs and (
-            intent.wants_inbox_processing
-            or intent.wants_channel_status_lookup
-            or any(token in text for token in ("telegram", "discord", "otp", "channel", "status"))
-        ):
-            _add_grounding_target(targets, seen, "list", "/docs/channels")
-            _add_grounding_target(targets, seen, "read", "/docs/channels/AGENTS.MD")
-            _add_grounding_target(targets, seen, "read", "/docs/channels/Telegram.txt")
-            _add_grounding_target(targets, seen, "read", "/docs/channels/Discord.txt")
-            _add_grounding_target(targets, seen, "read", "/docs/channels/otp.txt")
-
-    if capabilities.has_purchase_processing and intent.wants_purchase_fix:
-        _add_grounding_target(targets, seen, "read", "/docs/purchase-id-workflow.md")
-        _add_grounding_target(targets, seen, "read", "/docs/purchase-records.md")
-        _add_grounding_target(targets, seen, "read", "/processing/README.MD")
-        _add_grounding_target(targets, seen, "list", "/processing")
-        if any(token in text for token in ("audit", "regression", "prefix", "history")):
-            _add_grounding_target(targets, seen, "read", "/purchases/audit.json")
-
-    for root in relevant_roots(frame):
-        if root != "/":
-            _add_grounding_target(targets, seen, "list", root)
-
-    return targets
-
-
 def command_paths(cmd: ToolRequest) -> list[str]:
     if isinstance(cmd, Req_Tree):
         return [normalize_repo_path(cmd.root)]
@@ -469,33 +254,6 @@ def is_mutating_command(cmd: ToolRequest) -> bool:
 
 def is_verification_command(cmd: ToolRequest) -> bool:
     return isinstance(cmd, (Req_Tree, Req_List, Req_Read, Req_Search, Req_Find))
-
-
-def relevant_roots(frame: TaskFrame) -> list[str]:
-    roots: list[str] = []
-    for root in frame.relevant_roots:
-        normalized = normalize_repo_path(root)
-        if normalized not in roots:
-            roots.append(normalized)
-    return roots
-
-
-def candidate_agent_paths(target_path: str) -> list[str]:
-    normalized = normalize_repo_path(target_path)
-    path_obj = PurePosixPath(normalized)
-    if "." in path_obj.name:
-        dirs = list(path_obj.parents)
-    else:
-        dirs = [path_obj, *path_obj.parents]
-    ordered: list[str] = []
-    for directory in reversed(dirs):
-        for agent_name in AGENT_FILE_NAMES:
-            candidate = normalize_repo_path(f"{directory}/{agent_name}")
-            if candidate in {"/AGENTS.md", "/AGENTS.MD"}:
-                continue
-            if candidate not in ordered:
-                ordered.append(candidate)
-    return ordered
 
 
 def overlap(left: str, right: str) -> bool:

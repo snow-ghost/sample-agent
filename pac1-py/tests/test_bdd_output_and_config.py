@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from main import _build_totals, _render_summary_table
+from main import _build_totals, _full_run_log_path, _render_summary_table
 from pac1_agent.config import AgentConfig, _should_use_gbnf
 from pac1_agent.llm import (
     GBNF_NEXT_STEP,
@@ -101,6 +101,15 @@ class OutputAndConfigBddTests(unittest.TestCase):
         self.assertEqual(totals["avg_tokens_per_task"], 1550.0)
         self.assertEqual(totals["avg_llm_time_ms_when_used"], 1200.0)
         self.assertEqual(totals["avg_tokens_when_used"], 3100.0)
+
+    def test_given_full_run_when_resolving_log_path_then_latest_full_run_file_is_used(self) -> None:
+        path = _full_run_log_path([])
+
+        self.assertIsNotNone(path)
+        self.assertEqual(path.name, "latest_full_run.txt")
+
+    def test_given_partial_run_when_resolving_log_path_then_no_full_log_file_is_written(self) -> None:
+        self.assertIsNone(_full_run_log_path(["t06"]))
 
     def test_given_local_gbnf_config_when_building_llm_request_then_grammar_is_attached(self) -> None:
         client = JsonChatClient(

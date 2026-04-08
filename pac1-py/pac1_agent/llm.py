@@ -152,6 +152,7 @@ class JsonChatClient:
         self.client = OpenAI(
             api_key=config.openai_api_key,
             base_url=config.openai_base_url,
+            timeout=config.request_timeout_seconds,
         )
 
     def complete_json(
@@ -217,7 +218,10 @@ class JsonChatClient:
         if self.config.use_gbnf_grammar:
             grammar = _grammar_for_model(response_model)
             if grammar is not None:
-                return self._create_completion_with_raw_gbnf(messages, grammar)
+                return self._create_completion_with_raw_gbnf(
+                    messages,
+                    grammar,
+                )
         return self.client.chat.completions.create(
             **self._request_kwargs(messages, response_model)
         )
@@ -262,7 +266,10 @@ class JsonChatClient:
             headers=headers,
             method="POST",
         )
-        with urllib_request.urlopen(req, timeout=120) as resp:
+        with urllib_request.urlopen(
+            req,
+            timeout=self.config.request_timeout_seconds,
+        ) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
 

@@ -195,6 +195,8 @@ message LogLine {
 message StartRunRequest {
   string benchmark_id = 1;
   string name = 2;
+  // optional BitGN API key used for protected leaderboard runs
+  string api_key = 3;
 }
 
 message StartRunResponse {

@@ -8,14 +8,23 @@ from typing import Iterable, Literal
 RepositoryProfile = Literal["generic", "knowledge_repo", "typed_crm_fs", "purchase_ops"]
 INBOX_REFERENCE_MARKERS = (
     "inbox",
+    "queue",
+    "incoming queue",
+    "inbound queue",
     "inbound note",
     "inbound message",
     "incoming message",
     "incoming note",
+    "inbound item",
+    "incoming item",
+    "inbox item",
+    "inbound drop",
+    "incoming drop",
 )
 INBOX_ACTION_MARKERS = (
     "process",
     "handle",
+    "take care of",
     "triage",
     "review",
     "resolve",
@@ -30,6 +39,9 @@ INBOX_SEQUENCE_MARKERS = (
     "oldest inbox",
     "oldest message",
     "oldest pending",
+    "oldest unresolved",
+    "earliest unread",
+    "earliest pending",
     "review the next",
 )
 OUTBOUND_EMAIL_MARKERS = (
@@ -58,10 +70,38 @@ COUNT_STYLE_MARKERS = ("how many", "count ", "number of", "total ")
 PURCHASE_MARKERS = ("purchase", "invoice id", "id prefix")
 PURCHASE_FIX_MARKERS = ("prefix", "regression", "downstream", "lane", "workflow", "emitter", "processing")
 FOLLOW_UP_MARKERS = ("follow-up", "follow up", "reminder", "next follow-up", "followup")
-FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to")
+FOLLOW_UP_UPDATE_MARKERS = ("move", "reschedule", "postpone", "shift", "change", "fix", "update", "set to", "bump", "move out")
 LOOKUP_EMAIL_MARKERS = ("email address", "primary contact email", "return only the email", "answer with the email")
-CLEANUP_KNOWLEDGE_MARKERS = ("thread", "card", "captured", "remove", "discard", "delete", "start over")
+CLEANUP_KNOWLEDGE_MARKERS = (
+    "thread",
+    "card",
+    "captured",
+    "remove",
+    "discard",
+    "delete",
+    "start over",
+    "clear",
+    "purge",
+)
 CAPTURE_DISTILL_MARKERS = ("capture", "captur", "distill", "snippet", "excerpt")
+ACTION_WORDS = frozenset({"process", "handle", "triage", "review", "resolve", "work", "act", "sort"})
+ORDER_WORDS = frozenset({"next", "oldest", "earliest", "pending", "unread", "unresolved", "lowest", "first"})
+INBOX_WORDS = frozenset({"inbox", "inbound", "incoming"})
+ITEM_WORDS = frozenset(
+    {"message", "messages", "note", "notes", "item", "items", "drop", "drops", "file", "files", "queue"}
+)
+EMAIL_WORDS = frozenset({"email", "mail", "address"})
+OUTBOUND_WORDS = frozenset({"send", "write", "reply", "draft", "compose"})
+ROLE_WORDS = frozenset({"primary", "contact", "manager", "lead", "owner"})
+ROLE_ACTION_WORDS = frozenset({"manage", "manages", "managed", "own", "owns", "owned"})
+ANSWER_STYLE_WORDS = frozenset({"return", "answer", "give", "just", "only", "what", "provide", "share"})
+FOLLOW_UP_WORDS = frozenset({"follow", "followup", "reminder", "touchpoint", "reconnect", "checkin"})
+UPDATE_WORDS = frozenset(
+    {"move", "reschedule", "postpone", "shift", "change", "fix", "update", "set", "push", "delay", "bump"}
+)
+CAPTURE_WORDS = frozenset({"capture", "captur", "distill", "distillation", "snippet", "excerpt", "clip", "quote"})
+DELETE_WORDS = frozenset({"remove", "discard", "delete", "purge", "clear"})
+TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -105,14 +145,77 @@ def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _tokenize(text: str) -> tuple[str, ...]:
+    return tuple(TOKEN_RE.findall(text.lower()))
+
+
+def _has_any_token(tokens: tuple[str, ...], words: frozenset[str]) -> bool:
+    return any(token in words for token in tokens)
+
+
 def _references_inbox_surface(text: str) -> bool:
     return _contains_any(text, INBOX_REFERENCE_MARKERS)
 
 
-def _wants_inbox_processing(text: str) -> bool:
-    return _references_inbox_surface(text) and (
-        _contains_any(text, INBOX_ACTION_MARKERS) or _contains_any(text, INBOX_SEQUENCE_MARKERS)
+def _references_inbox_surface_tokens(tokens: tuple[str, ...]) -> bool:
+    return _has_any_token(tokens, INBOX_WORDS) and _has_any_token(tokens, ITEM_WORDS)
+
+
+def _wants_inbox_processing(text: str, tokens: tuple[str, ...]) -> bool:
+    return (_references_inbox_surface(text) or _references_inbox_surface_tokens(tokens)) and (
+        _contains_any(text, INBOX_ACTION_MARKERS)
+        or _contains_any(text, INBOX_SEQUENCE_MARKERS)
+        or _has_any_token(tokens, ACTION_WORDS)
+        or _has_any_token(tokens, ORDER_WORDS)
     )
+
+
+def _wants_outbound_email(text: str, tokens: tuple[str, ...]) -> bool:
+    if _contains_any(text, OUTBOUND_EMAIL_MARKERS):
+        return True
+    if _has_any_token(tokens, EMAIL_WORDS) and _has_any_token(tokens, OUTBOUND_WORDS):
+        return True
+    return "subject" in tokens and "body" in tokens and (
+        _has_any_token(tokens, EMAIL_WORDS) or _has_any_token(tokens, OUTBOUND_WORDS)
+    )
+
+
+def _wants_follow_up_update(text: str, tokens: tuple[str, ...]) -> bool:
+    if _contains_any(text, FOLLOW_UP_MARKERS) and _contains_any(text, FOLLOW_UP_UPDATE_MARKERS):
+        return True
+    if _has_any_token(tokens, FOLLOW_UP_WORDS) and _has_any_token(tokens, UPDATE_WORDS):
+        return True
+    return "two" in tokens and "weeks" in tokens and "reconnect" in tokens
+
+
+def _wants_lookup_email(text: str, tokens: tuple[str, ...]) -> bool:
+    if _contains_any(text, LOOKUP_EMAIL_MARKERS):
+        return True
+    if not _has_any_token(tokens, EMAIL_WORDS):
+        return False
+    has_role_shape = (_has_any_token(tokens, ROLE_WORDS) or _has_any_token(tokens, ROLE_ACTION_WORDS)) and (
+        "account" in tokens
+    )
+    has_contact_shape = "contact" in tokens and ("primary" in tokens or "account" in tokens)
+    if not (has_role_shape or has_contact_shape):
+        return False
+    if _has_any_token(tokens, ANSWER_STYLE_WORDS):
+        return True
+    return not _has_any_token(tokens, OUTBOUND_WORDS)
+
+
+def _wants_capture_or_distill(text: str, tokens: tuple[str, ...]) -> bool:
+    if _contains_any(text, CAPTURE_DISTILL_MARKERS):
+        return True
+    return _has_any_token(tokens, CAPTURE_WORDS) and (
+        '"' in text or "website" in tokens or "into" in tokens or "from" in tokens
+    )
+
+
+def _wants_cleanup_or_delete(text: str, tokens: tuple[str, ...]) -> bool:
+    if _contains_any(text, CLEANUP_KNOWLEDGE_MARKERS):
+        return True
+    return _has_any_token(tokens, DELETE_WORDS) and any(token in {"thread", "card", "captured"} for token in tokens)
 
 
 def infer_repository_profile(root_entries: set[str]) -> RepositoryProfile:
@@ -162,13 +265,14 @@ def infer_workspace_capabilities(
 
 def extract_task_intent(task_text: str) -> TaskIntent:
     normalized_text = " ".join(task_text.lower().split())
+    tokens = _tokenize(normalized_text)
     word_count = len(task_text.strip().split())
     mentions_deictic_reference = bool(
         re.search(r"(^|\s)(this|that|these|those)(\s|$)", normalized_text)
     )
 
-    wants_inbox_processing = _wants_inbox_processing(normalized_text)
-    wants_outbound_email = _contains_any(normalized_text, OUTBOUND_EMAIL_MARKERS)
+    wants_inbox_processing = _wants_inbox_processing(normalized_text, tokens)
+    wants_outbound_email = _wants_outbound_email(normalized_text, tokens)
     wants_calendar_workflow = _contains_any(normalized_text, CALENDAR_MARKERS) or (
         "calendar" in normalized_text and "invite" in normalized_text
     )
@@ -186,13 +290,10 @@ def extract_task_intent(task_text: str) -> TaskIntent:
         normalized_text,
         PURCHASE_FIX_MARKERS,
     )
-    wants_follow_up_update = _contains_any(normalized_text, FOLLOW_UP_MARKERS) and _contains_any(
-        normalized_text,
-        FOLLOW_UP_UPDATE_MARKERS,
-    )
-    wants_lookup_email = _contains_any(normalized_text, LOOKUP_EMAIL_MARKERS)
-    wants_capture_or_distill = _contains_any(normalized_text, CAPTURE_DISTILL_MARKERS)
-    wants_cleanup_or_delete = _contains_any(normalized_text, CLEANUP_KNOWLEDGE_MARKERS)
+    wants_follow_up_update = _wants_follow_up_update(normalized_text, tokens)
+    wants_lookup_email = _wants_lookup_email(normalized_text, tokens)
+    wants_capture_or_distill = _wants_capture_or_distill(normalized_text, tokens)
+    wants_cleanup_or_delete = _wants_cleanup_or_delete(normalized_text, tokens)
 
     return TaskIntent(
         normalized_text=normalized_text,
