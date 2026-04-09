@@ -101,6 +101,70 @@ class OutputAndConfigBddTests(unittest.TestCase):
         self.assertEqual(totals["avg_tokens_per_task"], 1550.0)
         self.assertEqual(totals["avg_llm_time_ms_when_used"], 1200.0)
         self.assertEqual(totals["avg_tokens_when_used"], 3100.0)
+        self.assertEqual(totals["scores_available"], 1)
+        self.assertEqual(totals["scored_tasks_count"], 2)
+
+    def test_given_task_rows_when_score_is_hidden_then_totals_mark_scores_unavailable(self) -> None:
+        totals = _build_totals(
+            [
+                {
+                    "task_id": "t06",
+                    "score": "N/A",
+                    "wall_time_ms": 1500,
+                    "llm_calls": 0,
+                    "llm_time_ms": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            ],
+            0.0,
+        )
+
+        self.assertEqual(totals["scores_available"], 0)
+        self.assertEqual(totals["scored_tasks_count"], 0)
+        self.assertEqual(totals["tasks_failed"], 0)
+
+    def test_given_task_rows_when_some_scores_hidden_then_failed_counts_only_scored_errors(self) -> None:
+        totals = _build_totals(
+            [
+                {
+                    "task_id": "t06",
+                    "score": "1.00",
+                    "wall_time_ms": 1000,
+                    "llm_calls": 0,
+                    "llm_time_ms": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                {
+                    "task_id": "t07",
+                    "score": "N/A",
+                    "wall_time_ms": 1000,
+                    "llm_calls": 0,
+                    "llm_time_ms": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+                {
+                    "task_id": "t08",
+                    "score": "0.00",
+                    "wall_time_ms": 1000,
+                    "llm_calls": 0,
+                    "llm_time_ms": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            ],
+            66.67,
+        )
+
+        self.assertEqual(totals["tasks_passed"], 1)
+        self.assertEqual(totals["scored_tasks_count"], 2)
+        self.assertEqual(totals["tasks_failed"], 1)
 
     def test_given_full_run_when_resolving_log_path_then_latest_full_run_file_is_used(self) -> None:
         path = _full_run_log_path([])

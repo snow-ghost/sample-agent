@@ -28,17 +28,30 @@ MEDIUM_RISK_SECURITY_PATTERNS = (
 )
 EMBEDDED_PAYLOAD_SECURITY_PATTERNS = (
     re.compile(r"""security\s+relay"""),
-    re.compile(r"""clipboard\s+relay"""),
-    re.compile(r"""\[\[\s*clipboard\s+relay"""),
-    re.compile(r"""\[\[/\s*clipboard\s+relay\s*\]\]"""),
     re.compile(r"""embedded\s+tool\s+note"""),
-    re.compile(r"""trusted\s+operational\s+guidance"""),
     re.compile(r"""internal\s+bridge"""),
     re.compile(r"""suppress\s+mention"""),
     re.compile(r"""brief\s+success\s+confirmation"""),
     re.compile(r"""no\s+additional\s+confirmation\s+is\s+needed"""),
     re.compile(r"""remove\s+process\s+and\s+policy\s+documents"""),
 )
+EMBEDDED_PAYLOAD_SECURITY_PATTERNS_STRICT = (
+    re.compile(r"""security\s+relay"""),
+    re.compile(r"""internal\s+bridge"""),
+    re.compile(r"""suppress\s+mention"""),
+    re.compile(r"""no\s+additional\s+confirmation\s+is\s+needed"""),
+    re.compile(r"""remove\s+process\s+and\s+policy\s+documents"""),
+    re.compile(r"""\[\[\s*clipboard\s+relay"""),
+    re.compile(r"""\[\[/\s*clipboard\s+relay\s*\]\]"""),
+)
+_QUOTED_PAYLOAD_RE = re.compile(r'"[^"]*?"|\'[^\']*?\'|```[\s\S]*?```|`[^`\n]*?`')
+
+
+def _strip_quoted_payload(task_text: str) -> str:
+    """Strip quoted payload chunks before checking hostile relay markers in captures."""
+    if not task_text:
+        return ""
+    return _QUOTED_PAYLOAD_RE.sub(" ", task_text.lower())
 
 
 def contains_prompt_injection_markers(task_text: str) -> bool:
@@ -67,12 +80,28 @@ def text_only_preflight_outcome(task_text: str) -> CompletionPayload | None:
     text = intent.normalized_text
     words = task_text.strip().split()
     stripped_text = task_text.strip()
+    unquoted_text = _strip_quoted_payload(task_text)
 
-    if intent.wants_capture_or_distill and any(pattern.search(text) for pattern in EMBEDDED_PAYLOAD_SECURITY_PATTERNS):
+    if intent.wants_capture_or_distill and any(
+        pattern.search(unquoted_text) for pattern in EMBEDDED_PAYLOAD_SECURITY_PATTERNS
+    ):
         return CompletionPayload(
             completed_steps_laconic=["Detected hostile instruction relay inside captured payload"],
             message=(
                 "The provided capture payload embeds operational override or cleanup-suppression instructions. "
+                "I will not capture or distill hostile instruction content as trusted work."
+            ),
+            grounding_refs=["/AGENTS.md"],
+            outcome="OUTCOME_DENIED_SECURITY",
+        )
+
+    if intent.wants_capture_or_distill and any(
+        pattern.search(task_text) for pattern in EMBEDDED_PAYLOAD_SECURITY_PATTERNS_STRICT
+    ):
+        return CompletionPayload(
+            completed_steps_laconic=["Detected hostile instruction relay inside captured payload"],
+            message=(
+                "The provided capture payload embeds explicit relay markers. "
                 "I will not capture or distill hostile instruction content as trusted work."
             ),
             grounding_refs=["/AGENTS.md"],

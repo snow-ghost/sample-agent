@@ -33,6 +33,7 @@ CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
+CLI_YELLOW = "\x1B[33m"
 
 
 class _TeeStdout:
@@ -82,12 +83,16 @@ def _render_summary_table(task_rows: list[dict[str, str | int | float]]) -> str:
 
 def _build_totals(task_rows: list[dict[str, str | int | float]], final_score: float) -> dict[str, int | float]:
     task_count = len(task_rows) or 1
+    scored_rows = [row for row in task_rows if str(row["score"]).strip() not in {"N/A", "NA", "", "None", "ERR"}]
     llm_task_count = sum(1 for row in task_rows if int(row["llm_calls"]) > 0)
     llm_divisor = llm_task_count or 1
+    scored_failed_rows = [row for row in scored_rows if row["score"] != "1.00"]
     return {
         "tasks_run": len(task_rows),
         "tasks_passed": sum(1 for row in task_rows if row["score"] == "1.00"),
-        "tasks_failed": sum(1 for row in task_rows if row["score"] != "1.00"),
+        "tasks_failed": len(scored_failed_rows),
+        "scores_available": 1 if scored_rows else 0,
+        "scored_tasks_count": len(scored_rows),
         "final_score_percent": round(final_score, 2),
         "wall_time_ms": sum(int(row["wall_time_ms"]) for row in task_rows),
         "llm_calls": sum(int(row["llm_calls"]) for row in task_rows),
@@ -171,10 +176,40 @@ def _full_run_log_path(task_filter: list[str]) -> Path | None:
     return output_dir / "latest_full_run.txt"
 
 
+def _clear_previous_run_artifacts() -> None:
+    output_dir = Path("benchmark-runs")
+    if not output_dir.exists():
+        return
+    for path in output_dir.glob("latest_*.txt"):
+        if path.is_file():
+            path.unlink()
+    for path in output_dir.glob("latest_*.json"):
+        if path.is_file():
+            path.unlink()
+    for path in output_dir.glob("latest_*.csv"):
+        if path.is_file():
+            path.unlink()
+
+
+def _is_auth_error(exc: ConnectError) -> bool:
+    code = getattr(exc, "code", None)
+    if code is None:
+        return False
+    name = getattr(code, "name", None)
+    if isinstance(name, str):
+        return name in {"UNAUTHENTICATED", "PERMISSION_DENIED"}
+    code_value = str(code)
+    return code_value in {"Code.UNAUTHENTICATED", "Code.PERMISSION_DENIED"}
+
+
 def _run_benchmark(task_filter: list[str]) -> None:
     scores = []
     task_rows: list[dict[str, str | int | float]] = []
+    run_response = None
     try:
+        if not task_filter and os.getenv("CLEAN_PREVIOUS_RUN_ARTIFACTS") == "1":
+            _clear_previous_run_artifacts()
+
         client = HarnessServiceClientSync(BITGN_URL)
         print("Connecting to BitGN", client.status(StatusRequest()))
         res = client.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
@@ -187,21 +222,38 @@ def _run_benchmark(task_filter: list[str]) -> None:
             tasks = [task for task in res.tasks if task.task_id in set(task_filter)]
             print(f"Running {len(tasks)} filtered tasks via playground")
         else:
-            run_response = client.start_run(
-                StartRunRequest(
-                    benchmark_id=BENCHMARK_ID,
-                    name=BITGN_RUN_NAME,
-                    api_key=BITGN_API_KEY,
+            try:
+                run_response = client.start_run(
+                    StartRunRequest(
+                        benchmark_id=BENCHMARK_ID,
+                        name=BITGN_RUN_NAME,
+                        api_key=BITGN_API_KEY,
+                    )
                 )
-            )
-            trial_ids = list(run_response.trial_ids)
-            tasks = list(res.tasks)
-            if len(trial_ids) < len(tasks):
-                print(f"start_run returned only {len(trial_ids)} trial ids, expected {len(tasks)}")
-            print(f"Running leaderboard run {run_response.run_id} for {len(tasks)} tasks")
+            except ConnectError as exc:
+                if _is_auth_error(exc):
+                    print(
+                        f"{CLI_YELLOW}Run mode unavailable ({exc.code}: {exc.message}) — "
+                        f"running via playground fallback.{CLI_CLR}"
+                    )
+                else:
+                    raise
+                run_response = None
+
+            if run_response is None:
+                tasks = list(res.tasks)
+                print("Running full benchmark via playground fallback")
+            else:
+                trial_ids = list(run_response.trial_ids)
+                tasks = list(res.tasks)
+                if len(trial_ids) < len(tasks):
+                    print(
+                        f"start_run returned only {len(trial_ids)} trial ids, expected {len(tasks)}"
+                    )
+                print(f"Running leaderboard run {run_response.run_id} for {len(tasks)} tasks")
 
         for idx, task in enumerate(tasks):
-            if task_filter:
+            if run_response is None or idx >= len(run_response.trial_ids):
                 print(f"{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
                 trial = client.start_playground(
                     StartPlaygroundRequest(
@@ -223,56 +275,74 @@ def _run_benchmark(task_filter: list[str]) -> None:
                 print(exc)
 
             result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-            if result.score >= 0:
-                scores.append((task.task_id, result.score))
-                task_rows.append(
-                    {
-                        "task_id": task.task_id,
-                        "score": f"{result.score:0.2f}",
-                        "wall_time_ms": telemetry.wall_time_ms,
-                        "llm_calls": telemetry.llm_calls,
-                        "llm_time_ms": telemetry.llm_time_ms,
-                        "prompt_tokens": telemetry.prompt_tokens,
-                        "completion_tokens": telemetry.completion_tokens,
-                        "total_tokens": telemetry.total_tokens,
-                    }
-                )
-                style = CLI_GREEN if result.score == 1 else CLI_RED
+            score_value = getattr(result, "score", None)
+            score_text = "N/A"
+            if score_value is not None:
+                score_float = float(score_value)
+                scores.append((task.task_id, score_float))
+                score_text = f"{score_float:0.2f}"
+            task_rows.append(
+                {
+                    "task_id": task.task_id,
+                    "score": score_text,
+                    "wall_time_ms": telemetry.wall_time_ms,
+                    "llm_calls": telemetry.llm_calls,
+                    "llm_time_ms": telemetry.llm_time_ms,
+                    "prompt_tokens": telemetry.prompt_tokens,
+                    "completion_tokens": telemetry.completion_tokens,
+                    "total_tokens": telemetry.total_tokens,
+                }
+            )
+
+            if score_value is None:
+                print(f"\n{CLI_YELLOW}Score: N/A (scoring hidden/unavailable){CLI_CLR}")
+            else:
+                style = CLI_GREEN if score_float == 1 else CLI_RED
                 explain = textwrap.indent("\n".join(result.score_detail), "  ")
-                print(f"\n{style}Score: {result.score:0.2f}\n{explain}\n{CLI_CLR}")
-                print(
-                    "Telemetry: "
-                    f"wall={telemetry.wall_time_ms} ms, "
-                    f"llm_calls={telemetry.llm_calls}, "
-                    f"llm_time={telemetry.llm_time_ms} ms, "
-                    f"tokens={telemetry.total_tokens} "
-                    f"(prompt={telemetry.prompt_tokens}, completion={telemetry.completion_tokens})"
-                )
+                print(f"\n{style}Score: {score_float:0.2f}\n{explain}\n{CLI_CLR}")
+            print(
+                "Telemetry: "
+                f"wall={telemetry.wall_time_ms} ms, "
+                f"llm_calls={telemetry.llm_calls}, "
+                f"llm_time={telemetry.llm_time_ms} ms, "
+                f"tokens={telemetry.total_tokens} "
+                f"(prompt={telemetry.prompt_tokens}, completion={telemetry.completion_tokens})"
+            )
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
     except KeyboardInterrupt:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
-    if scores:
+    if task_rows:
         print("\nSummary:")
         print(_render_summary_table(task_rows))
 
-    total = sum(score for _, score in scores) / len(scores) * 100.0
+    if scores:
+        total = sum(score for _, score in scores) / len(scores) * 100.0
+    else:
+        total = 0.0
     totals = _build_totals(task_rows, total)
-    print(f"FINAL: {total:0.2f}%")
+    if totals["scores_available"] == 1:
+        print(f"FINAL: {total:0.2f}%")
+    else:
+        print("FINAL: N/A (scoring hidden/unavailable)")
     if not task_filter:
-        submit_response = client.submit_run(SubmitRunRequest(run_id=run_response.run_id))
-        if isinstance(submit_response.state, int):
-            state_text = RunState.Name(submit_response.state)
+        if run_response is not None:
+            submit_response = client.submit_run(SubmitRunRequest(run_id=run_response.run_id))
+            if isinstance(submit_response.state, int):
+                state_text = RunState.Name(submit_response.state)
+            else:
+                state_text = submit_response.state.name
+            print(f"SubmitRun state={state_text}")
         else:
-            state_text = submit_response.state.name
-        print(f"SubmitRun state={state_text}")
+            print("SubmitRun skipped (playground fallback mode)")
     print(
         "TOTALS: "
         f"tasks={totals['tasks_run']}, "
         f"passed={totals['tasks_passed']}, "
         f"failed={totals['tasks_failed']}, "
+        f"scored={totals['scored_tasks_count']}, "
         f"wall={totals['wall_time_ms']} ms, "
         f"llm_calls={totals['llm_calls']}, "
         f"llm_time={totals['llm_time_ms']} ms, "
